@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var launchAtLoginItem = NSMenuItem()
     private var launchAtLoginToggleView: SwitchMenuItemView!
     private var autoReloadItem = NSMenuItem()
+    private var autoRestartItem = NSMenuItem()
     private var remoteConfigItem = NSMenuItem()
 
     private var currentSystemProxyService: String?
@@ -40,6 +41,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// fires for that same stop — consumed (and cleared) there to post a "crashed"
     /// notification instead of a plain "stopped" one.
     private var pendingCrashStatus: Int32?
+
+    /// Snapshot of `lastKnownTUNEnabled` taken alongside `pendingCrashStatus`, i.e.
+    /// *before* `onStateChange` resets it — the mode sing-box should come back up
+    /// in if "Auto-restart sing-box" restarts it. `processManager.isTUNEnabled`
+    /// itself is already false again by the time either of these fire (reset by
+    /// the termination handler before it calls out), so this is the only place
+    /// that mode is still known.
+    private var pendingCrashWasTUNEnabled = false
+
+    /// Guards against a crash loop when "Auto-restart sing-box" is on and sing-box
+    /// keeps failing immediately (a config that passed `sing-box check` but still
+    /// fails at runtime, a TUN permission revoked mid-session, etc.). After
+    /// `maxAutoRestartsInWindow` attempts inside `autoRestartWindow`, auto-restart
+    /// pauses itself for the rest of this launch and tells the user, rather than
+    /// hammering `sudo sing-box` indefinitely. See `attemptAutoRestartIfEnabled`.
+    private var recentAutoRestartTimestamps: [Date] = []
+    private static let maxAutoRestartsInWindow = 3
+    private static let autoRestartWindow: TimeInterval = 60
 
     /// Transient message shown on the status line in place of "Running · Mode" /
     /// "Stopped" while an async validate/start/reload is in flight — e.g.
@@ -69,7 +88,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         processManager.onUnexpectedExit = { [weak self] status in
-            self?.pendingCrashStatus = status
+            guard let self else { return }
+            self.pendingCrashStatus = status
+            // Must capture this here, before onStateChange (called right after, by
+            // the same termination handler) resets processManager.isTUNEnabled —
+            // see this property's doc comment.
+            self.pendingCrashWasTUNEnabled = self.lastKnownTUNEnabled
         }
 
         processManager.onStateChange = { [weak self] running in
@@ -93,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     title: "sing-box Stopped Unexpectedly",
                     body: "sing-box exited unexpectedly (status \(crashStatus)). Check sing-box.log for details."
                 )
+                self.attemptAutoRestartIfEnabled(wasTUNEnabled: self.pendingCrashWasTUNEnabled)
             } else {
                 AppNotifier.post(
                     category: .singBoxRunState,
@@ -443,6 +468,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoReloadItem.target = self
         autoReloadItem.state = Preferences.autoReloadOnConfigChange ? .on : .off
         menu.addItem(autoReloadItem)
+
+        // Off by default: only notify on an unexpected exit (crash, or external
+        // termination) and otherwise leave sing-box stopped for manual
+        // intervention — same as before this toggle existed. See
+        // `attemptAutoRestartIfEnabled`, invoked from the crash branch of
+        // `onStateChange` above.
+        autoRestartItem.title = "Auto-restart sing-box"
+        autoRestartItem.action = #selector(toggleAutoRestartOnUnexpectedExit)
+        autoRestartItem.target = self
+        autoRestartItem.state = Preferences.autoRestartOnUnexpectedExit ? .on : .off
+        menu.addItem(autoRestartItem)
 
         // Remote Config submenu — a periodic downloader that writes over the
         // active profile file (see RemoteConfigUpdater); what happens after a
@@ -928,6 +964,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Preferences.autoReloadOnConfigChange = newValue
         autoReloadItem.state = newValue ? .on : .off
         AppLog.log("Auto Reload on Config Change \(newValue ? "enabled" : "disabled")")
+    }
+
+    @objc private func toggleAutoRestartOnUnexpectedExit() {
+        let newValue = !Preferences.autoRestartOnUnexpectedExit
+        Preferences.autoRestartOnUnexpectedExit = newValue
+        autoRestartItem.state = newValue ? .on : .off
+        AppLog.log("Auto-restart sing-box \(newValue ? "enabled" : "disabled")")
+    }
+
+    /// Attempts to bring sing-box back up after an unexpected exit, if the user
+    /// has "Auto-restart sing-box" on — a no-op otherwise, leaving the "stopped
+    /// unexpectedly" notification already posted by the caller as the whole story,
+    /// same as this app's behavior before this toggle existed.
+    ///
+    /// Restarts in whatever mode (TUN vs. normal) sing-box was actually running in
+    /// right before it exited — see `pendingCrashWasTUNEnabled`'s doc comment for
+    /// why that has to be passed in rather than read fresh here.
+    ///
+    /// Rate-limited via `recentAutoRestartTimestamps` so a config that's broken at
+    /// runtime (despite passing `sing-box check`) can't turn into an unbounded
+    /// restart loop — see those properties' doc comment.
+    private func attemptAutoRestartIfEnabled(wasTUNEnabled: Bool) {
+        guard Preferences.autoRestartOnUnexpectedExit else { return }
+        guard let path = Preferences.activeProfilePath else {
+            AppLog.error("Auto-restart sing-box: no active profile to restart with.")
+            return
+        }
+
+        let now = Date()
+        recentAutoRestartTimestamps.removeAll { now.timeIntervalSince($0) > Self.autoRestartWindow }
+        guard recentAutoRestartTimestamps.count < Self.maxAutoRestartsInWindow else {
+            AppLog.error(
+                "Auto-restart sing-box: \(Self.maxAutoRestartsInWindow) restarts within \(Int(Self.autoRestartWindow))s — " +
+                        "pausing auto-restart for the rest of this session to avoid a crash loop. Check sing-box.log, fix the " +
+                        "underlying issue, then restart manually from the menu."
+            )
+            AppNotifier.post(
+                category: .singBoxRunState,
+                title: "Auto-restart Paused",
+                body: "sing-box kept exiting immediately, so auto-restart has paused itself for this session. Check sing-box.log, then restart manually."
+            )
+            return
+        }
+        recentAutoRestartTimestamps.append(now)
+
+        AppLog.log("Auto-restart sing-box: attempting restart (\(wasTUNEnabled ? "TUN" : "Normal") mode)")
+        startSingBox(configPath: path, enableTUN: wasTUNEnabled, busyMessage: "Auto-restarting…") { [weak self] result in
+            switch result {
+            case .success:
+                AppLog.log("Auto-restart sing-box succeeded")
+            case .failure(let error):
+                AppLog.error("Auto-restart sing-box failed: \(error.localizedDescription)")
+                self?.showNonBlockingAlert(title: "Auto-restart Failed", message: error.localizedDescription)
+            }
+        }
     }
 
     @objc private func setRemoteConfigURL() {

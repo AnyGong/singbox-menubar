@@ -56,6 +56,7 @@ enum Preferences {
         static let launchAtLogin = "launchAtLogin"
         static let preferredNetworkService = "preferredNetworkService"
         static let autoReloadOnConfigChange = "autoReloadOnConfigChange"
+        static let autoRestartOnUnexpectedExit = "autoRestartOnUnexpectedExit"
         static let remoteConfigURL = "remoteConfigURL"
         static let remoteConfigInterval = "remoteConfigInterval"
         static let disabledNotificationCategories = "disabledNotificationCategories"
@@ -105,6 +106,15 @@ enum Preferences {
     static var autoReloadOnConfigChange: Bool {
         get { defaults.bool(forKey: Keys.autoReloadOnConfigChange) }
         set { defaults.set(newValue, forKey: Keys.autoReloadOnConfigChange) }
+    }
+
+    /// Off by default — matches the pre-existing behavior of only notifying on an
+    /// unexpected exit (crash, or external termination of a process this app
+    /// started) and otherwise leaving sing-box stopped until manual intervention.
+    /// See `AppDelegate.attemptAutoRestartIfEnabled`.
+    static var autoRestartOnUnexpectedExit: Bool {
+        get { defaults.bool(forKey: Keys.autoRestartOnUnexpectedExit) }
+        set { defaults.set(newValue, forKey: Keys.autoRestartOnUnexpectedExit) }
     }
 
     /// URL sing-box's config is downloaded from on the schedule below. `nil`/empty
