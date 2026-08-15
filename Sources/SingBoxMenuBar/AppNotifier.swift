@@ -1,17 +1,49 @@
 import Foundation
 import UserNotifications
 
+/// A distinguishable class of notification this app can post, individually
+/// toggleable via the "Notifications" submenu (see AppDelegate.buildMenu) so users
+/// who find one category noisy can turn just that one off rather than all-or-nothing.
+///
+/// The raw value doubles as the `UNNotificationRequest` identifier — notifications
+/// within a category replace one another instead of piling up (e.g. rapid System
+/// Proxy toggling only ever shows the latest state), which was already true before
+/// per-category enable/disable existed and continues to double as basic "don't spam
+/// duplicates" rate limiting alongside the new opt-out controls.
+enum NotificationCategory: String, CaseIterable {
+    case outboundMode = "outbound-mode"
+    case systemProxy = "system-proxy"
+    case tunMode = "tun-mode"
+    case singBoxRunState = "singbox-run-state"
+    case configChange = "config-change"
+
+    /// Shown in the "Notifications" submenu.
+    var displayName: String {
+        switch self {
+        case .outboundMode: return "Outbound Mode Changes"
+        case .systemProxy: return "System Proxy On/Off"
+        case .tunMode: return "Enhanced Mode (TUN) On/Off"
+        case .singBoxRunState: return "sing-box Started/Stopped"
+        case .configChange: return "Configuration File Changes"
+        }
+    }
+}
+
 /// Thin wrapper around `UNUserNotificationCenter` for the local system notifications
 /// this app posts on key state changes — outbound mode, System Proxy, Enhanced Mode
-/// (TUN), sing-box start/stop/crash, and external configuration-file changes.
+/// (TUN), sing-box start/stop/crash, and external configuration-file changes (see
+/// `NotificationCategory`). Which categories are actually allowed through is
+/// user-controlled — see the "Notifications" submenu and `Preferences
+/// .isNotificationCategoryEnabled`.
 ///
 /// Every call here is fire-and-forget and best-effort by design: a denied
 /// authorization, a missing app bundle (e.g. running via `swift run` rather than a
-/// packaged .app — see README), or a delivery failure should never block or alter
-/// any actual app behavior. Whether a notification is actually shown is left
-/// entirely up to `UNUserNotificationCenter`, which already accounts for the
-/// system's own notification settings (per-app permission, Do Not Disturb/Focus,
-/// etc.) — this type does not duplicate or second-guess that.
+/// packaged .app — see README), a disabled category, or a delivery failure should
+/// never block or alter any actual app behavior. Whether a notification is actually
+/// shown is left entirely up to `UNUserNotificationCenter`, which already accounts
+/// for the system's own notification settings (per-app permission, Do Not
+/// Disturb/Focus, etc.) — this type does not duplicate or second-guess that, only
+/// adds this app's own category-level opt-out on top.
 enum AppNotifier {
     private static var authorizationRequested = false
     private static var loggedMissingBundleWarning = false
@@ -55,18 +87,19 @@ enum AppNotifier {
         }
     }
 
-    /// Posts a local, non-blocking notification. Safe to call from any thread.
-    /// No-ops (after logging once) if not running as a bundled app — see
+    /// Posts a local, non-blocking notification, unless `category` is disabled in
+    /// Preferences (see the "Notifications" submenu) — checked first and cheaply,
+    /// before touching `UNUserNotificationCenter` at all, so a muted category costs
+    /// nothing beyond a dictionary lookup. Safe to call from any thread. Also
+    /// no-ops (after logging once) if not running as a bundled app — see
     /// `isRunningAsBundledApp`.
     ///
-    /// - Parameter identifier: Notifications sharing an identifier replace one
-    ///   another instead of piling up in Notification Center — used per-category
-    ///   (e.g. "outbound-mode", "system-proxy") so a burst of the same kind of
-    ///   change (rapid toggling, a flapping connection) doesn't spam the user with
-    ///   a growing stack, while still always showing the *latest* state. Pass a
-    ///   unique value (the default) for one-off notifications that should stack
-    ///   normally.
-    static func post(title: String, body: String, identifier: String = UUID().uuidString) {
+    /// Notifications within the same `category` replace one another in Notification
+    /// Center instead of piling up (identifier = `category.rawValue`) — a burst of
+    /// the same kind of change (rapid toggling, a flapping connection) always just
+    /// shows the latest state rather than a growing stack.
+    static func post(category: NotificationCategory, title: String, body: String) {
+        guard Preferences.isNotificationCategoryEnabled(category) else { return }
         guard isRunningAsBundledApp else {
             warnIfNotBundled()
             return
@@ -85,7 +118,7 @@ enum AppNotifier {
             // Notification Center.
             content.sound = nil
             // nil trigger = deliver immediately.
-            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+            let request = UNNotificationRequest(identifier: category.rawValue, content: content, trigger: nil)
             center.add(request) { error in
                 if let error {
                     AppLog.error("Failed to post notification '\(title)': \(error.localizedDescription)")

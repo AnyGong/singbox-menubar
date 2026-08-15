@@ -58,6 +58,7 @@ enum Preferences {
         static let autoReloadOnConfigChange = "autoReloadOnConfigChange"
         static let remoteConfigURL = "remoteConfigURL"
         static let remoteConfigInterval = "remoteConfigInterval"
+        static let disabledNotificationCategories = "disabledNotificationCategories"
     }
 
     static var outboundMode: OutboundMode {
@@ -124,5 +125,30 @@ enum Preferences {
             return interval
         }
         set { defaults.set(newValue.rawValue, forKey: Keys.remoteConfigInterval) }
+    }
+
+    /// Which notification categories are turned OFF — see the "Notifications"
+    /// submenu and `NotificationCategory`. Deliberately an opt-out set (stored as
+    /// the *disabled* ones) rather than an opt-in set of enabled ones: an empty set
+    /// means every category is on, matching this app's behavior before per-category
+    /// control existed, and any category added in the future is automatically on
+    /// for existing users too — no migration needed to "turn on" something new.
+    static var disabledNotificationCategories: Set<String> {
+        get { Set(defaults.stringArray(forKey: Keys.disabledNotificationCategories) ?? []) }
+        set { defaults.set(Array(newValue), forKey: Keys.disabledNotificationCategories) }
+    }
+
+    static func isNotificationCategoryEnabled(_ category: NotificationCategory) -> Bool {
+        !disabledNotificationCategories.contains(category.rawValue)
+    }
+
+    static func setNotificationCategory(_ category: NotificationCategory, enabled: Bool) {
+        var disabled = disabledNotificationCategories
+        if enabled {
+            disabled.remove(category.rawValue)
+        } else {
+            disabled.insert(category.rawValue)
+        }
+        disabledNotificationCategories = disabled
     }
 }

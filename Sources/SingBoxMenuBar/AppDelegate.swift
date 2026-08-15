@@ -79,9 +79,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if tunNowEnabled != self.lastKnownTUNEnabled {
                 self.lastKnownTUNEnabled = tunNowEnabled
                 AppNotifier.post(
+                    category: .tunMode,
                     title: tunNowEnabled ? "Enhanced Mode (TUN) Enabled" : "Enhanced Mode (TUN) Disabled",
-                    body: tunNowEnabled ? "sing-box is now routing traffic through the TUN interface." : "TUN interface torn down.",
-                    identifier: "tun-mode"
+                    body: tunNowEnabled ? "sing-box is now routing traffic through the TUN interface." : "TUN interface torn down."
                 )
             }
             self.tunItem.state = tunNowEnabled ? .on : .off
@@ -89,15 +89,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let crashStatus = self.pendingCrashStatus, !running {
                 self.pendingCrashStatus = nil
                 AppNotifier.post(
+                    category: .singBoxRunState,
                     title: "sing-box Stopped Unexpectedly",
-                    body: "sing-box exited unexpectedly (status \(crashStatus)). Check sing-box.log for details.",
-                    identifier: "singbox-run-state"
+                    body: "sing-box exited unexpectedly (status \(crashStatus)). Check sing-box.log for details."
                 )
             } else {
                 AppNotifier.post(
+                    category: .singBoxRunState,
                     title: running ? "sing-box Started" : "sing-box Stopped",
-                    body: running ? "sing-box is now running." : "sing-box is no longer running.",
-                    identifier: "singbox-run-state"
+                    body: running ? "sing-box is now running." : "sing-box is no longer running."
                 )
             }
 
@@ -214,26 +214,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard processManager.isRunning else {
             // Nothing is currently serving this config, so there's nothing to
             // reload — just let the user know the file on disk changed.
-            AppNotifier.post(
-                title: "Configuration Changed",
-                body: "\(name) changed on disk.",
-                identifier: "config-change"
-            )
+            AppNotifier.post(category: .configChange, title: "Configuration Changed", body: "\(name) changed on disk.")
             return
         }
 
         if Preferences.autoReloadOnConfigChange {
             AppNotifier.post(
+                category: .configChange,
                 title: "Configuration Changed",
-                body: "\(name) changed on disk. Reloading automatically…",
-                identifier: "config-change"
+                body: "\(name) changed on disk. Reloading automatically…"
             )
             reloadConfiguration()
         } else {
             AppNotifier.post(
+                category: .configChange,
                 title: "Configuration Changed",
-                body: "\(name) changed on disk. Reload it from the menu to apply, or enable Auto Reload on Config Change.",
-                identifier: "config-change"
+                body: "\(name) changed on disk. Reload it from the menu to apply, or enable Auto Reload on Config Change."
             )
         }
     }
