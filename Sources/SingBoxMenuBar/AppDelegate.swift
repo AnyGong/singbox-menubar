@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusLineItem = NSMenuItem()
     private var restartSingBoxItem = NSMenuItem()
     private var stopSingBoxItem = NSMenuItem()
+    private var controlPanelItem = NSMenuItem()
     private var outboundModeItem = NSMenuItem()
     private var systemProxyItem = NSMenuItem()
     private var tunItem = NSMenuItem()
@@ -338,11 +339,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        menu.addItem(withTitle: "Show Main Window", action: #selector(showMainWindow), keyEquivalent: "")
-        .target = self
-
-        menu.addItem(withTitle: "Open Control Panel in Default Browser", action: #selector(openControlPanel), keyEquivalent: "")
-        .target = self
+        // Only one entry point to the dashboard — previously duplicated by "Show
+        // Main Window" (an unwired stub opening no window) and this item. Disabled
+        // when sing-box isn't running, since 127.0.0.1:9090 won't be reachable —
+        // kept in sync alongside restart/stop in `updateStatusLine`.
+        controlPanelItem.title = "Open Control Panel"
+        controlPanelItem.action = #selector(openControlPanel)
+        controlPanelItem.target = self
+        controlPanelItem.isEnabled = processManager.isRunning
+        menu.addItem(controlPanelItem)
 
         menu.addItem(.separator())
 
@@ -449,15 +454,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         restartSingBoxItem.isEnabled = processManager.isRunning
         stopSingBoxItem.isEnabled = processManager.isRunning
+        controlPanelItem.isEnabled = processManager.isRunning
     }
 
     // MARK: - Actions
-
-    @objc private func showMainWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        // Wire up to an actual window controller if/when a main window is added.
-        // Left as a stub since the spec treats the menu bar as the primary surface.
-    }
 
     @objc private func openControlPanel() {
         NSWorkspace.shared.open(URL(string: "http://127.0.0.1:9090")!)
