@@ -42,6 +42,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// notification instead of a plain "stopped" one.
     private var pendingCrashStatus: Int32?
 
+    /// Transient message shown on the status line in place of "Running · Mode" /
+    /// "Stopped" while an async validate/start/reload is in flight — e.g.
+    /// "Switching to TUN mode…". `sing-box check` (run before every start — see
+    /// `SingBoxProcessManager.start`) can take several seconds resolving remote
+    /// rule-sets, so without this the status line would just sit unchanged for
+    /// that long with no indication anything is happening. Set/cleared via
+    /// `setBusyStatus`/`clearBusyStatus`, read by `updateStatusLine`.
+    private var busyStatusMessage: String?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.log("App launched")
 
@@ -529,16 +538,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (see `syncExternalState`), so piggybacking on it is what makes the status
     /// line track external changes (sing-box started/stopped/reconfigured outside
     /// this app) in real time too, without duplicating those triggers here.
+    ///
+    /// `busyStatusMessage`, when set, takes priority over the normal
+    /// running/stopped text — see `setBusyStatus`.
     private func updateStatusLine() {
-        if processManager.isRunning {
+        if let busyStatusMessage {
+            statusLineItem.title = "sing-box: \(busyStatusMessage)"
+        } else if processManager.isRunning {
             let mode = processManager.isTUNEnabled ? "TUN mode" : "Normal mode"
             statusLineItem.title = "sing-box: Running · \(mode)"
         } else {
             statusLineItem.title = "sing-box: Stopped"
         }
-        restartSingBoxItem.isEnabled = processManager.isRunning
-        stopSingBoxItem.isEnabled = processManager.isRunning
-        controlPanelItem.isEnabled = processManager.isRunning
+        let busy = busyStatusMessage != nil
+        restartSingBoxItem.isEnabled = processManager.isRunning && !busy
+        stopSingBoxItem.isEnabled = processManager.isRunning && !busy
+        controlPanelItem.isEnabled = processManager.isRunning && !busy
+    }
+
+    /// Shows a transient status-line message (e.g. "Switching to TUN mode…") and
+    /// disables Restart/Stop for the duration, so a several-second async operation
+    /// reads as "working on it" instead of the menu just not responding — see
+    /// `busyStatusMessage`'s doc comment for why this is needed.
+    private func setBusyStatus(_ message: String) {
+        busyStatusMessage = message
+        updateStatusLine()
+    }
+
+    private func clearBusyStatus() {
+        busyStatusMessage = nil
+        updateStatusLine()
+    }
+
+    /// Thin wrapper around `processManager.start` that shows/clears a busy status
+    /// message for the duration — every call site that starts/restarts sing-box
+    /// should go through this rather than calling `processManager.start` directly,
+    /// so the "don't just freeze" treatment is consistent everywhere (Enhanced
+    /// Mode, Reload Configuration, profile switches, System Proxy's auto-start).
+    private func startSingBox(configPath: String, enableTUN: Bool, busyMessage: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        setBusyStatus(busyMessage)
+        processManager.start(configPath: configPath, enableTUN: enableTUN) { [weak self] result in
+            self?.clearBusyStatus()
+            completion(result)
+        }
     }
 
     // MARK: - Actions
@@ -620,7 +662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // inbound is present — the two can coexist: turning TUN on later won't
             // disable this (see reconcileSystemProxyCapability).
             guard processManager.isRunning else {
-                processManager.start(configPath: path, enableTUN: false) { [weak self] result in
+                startSingBox(configPath: path, enableTUN: false, busyMessage: "Starting…") { [weak self] result in
                     guard let self else { return }
                     switch result {
                     case .success:
@@ -709,7 +751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             // Note: sing-box may already be running here in normal mode (e.g.
             // auto-started for System Proxy) — `start` restarts cleanly in that case.
-            processManager.start(configPath: path, enableTUN: true) { [weak self] result in
+            startSingBox(configPath: path, enableTUN: true, busyMessage: "Switching to TUN mode…") { [weak self] result in
                 if case .failure(let error) = result {
                     self?.showNonBlockingAlert(title: "Failed to Start sing-box", message: error.localizedDescription)
                 }
@@ -725,12 +767,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // shouldn't touch a currently-running sing-box, just because it was
         // clicked. Covers the case where sing-box isn't running yet too, where
         // otherwise nothing would validate this config until some later start.
-        let (ok, output) = processManager.validateConfig(at: url.path)
-        guard ok else {
-            showNonBlockingAlert(title: "Invalid Configuration", message: "\(url.lastPathComponent) failed validation:\n\(output)")
-            return
+        //
+        // Runs off the main thread: `sing-box check` can take several seconds
+        // (e.g. resolving remote rule-sets), and this is invoked directly from an
+        // @objc menu action — doing it inline here would freeze the whole menu for
+        // that long, same failure mode this file's `startSingBox` wrapper exists
+        // to avoid for the actual start/restart calls below.
+        setBusyStatus("Validating \(url.lastPathComponent)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let (ok, output) = self.processManager.validateConfig(at: url.path)
+            DispatchQueue.main.async {
+                guard ok else {
+                    self.clearBusyStatus()
+                    self.showNonBlockingAlert(title: "Invalid Configuration", message: "\(url.lastPathComponent) failed validation:\n\(output)")
+                    return
+                }
+                self.finishSelectingProfile(url: url) // clears busy status itself once settled
+            }
         }
+    }
 
+    /// The state-switching half of `selectProfile`, run once preflight validation
+    /// (on a background queue — see `selectProfile`) has confirmed the config is
+    /// valid.
+    private func finishSelectingProfile(url: URL) {
         let wasRunning = processManager.isRunning
         let wasTUNEnabled = processManager.isTUNEnabled
         Preferences.activeProfilePath = url.path
@@ -745,11 +806,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // again internally, which is redundant here but harmless — it's the
             // single source of truth for "is this config OK to run" and every start
             // path goes through it.
-            processManager.start(configPath: url.path, enableTUN: wasTUNEnabled) { [weak self] result in
+            startSingBox(configPath: url.path, enableTUN: wasTUNEnabled, busyMessage: "Switching profile…") { [weak self] result in
                 if case .failure(let error) = result {
                     self?.showNonBlockingAlert(title: "Profile Switch Failed", message: error.localizedDescription)
                 }
             }
+        } else {
+            clearBusyStatus() // nothing running to restart — the "Validating…" message from selectProfile is done
         }
     }
 
@@ -779,7 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func reloadConfiguration() {
         guard let path = Preferences.activeProfilePath else { return }
         // Same mode it was already running in — reload shouldn't change that.
-        processManager.start(configPath: path, enableTUN: processManager.isTUNEnabled) { [weak self] result in
+        startSingBox(configPath: path, enableTUN: processManager.isTUNEnabled, busyMessage: "Reloading configuration…") { [weak self] result in
             switch result {
             case .success:
                 AppLog.log("Configuration reloaded")

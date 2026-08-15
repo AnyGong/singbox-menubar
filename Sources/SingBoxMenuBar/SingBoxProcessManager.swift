@@ -74,6 +74,16 @@ final class SingBoxProcessManager {
     /// Validates then starts sing-box with the given config. Safe to call while a
     /// previous instance is running — it will be stopped first.
     ///
+    /// Validation (`sing-box check`, which can take several seconds — e.g. resolving
+    /// remote rule-sets — see requirements: this must not freeze the menu) and the
+    /// passwordless-sudo probe both run on a background queue; `completion` and
+    /// `onStateChange` are still always invoked back on the main thread, same as
+    /// before. Only the actual process-state mutation (stopping the previous
+    /// instance, spawning the new one) happens on main, in `finishStarting` — that
+    /// part is fast (no network/config-parsing involved) and keeps `self.process`/
+    /// `self.isRunning`/etc. mutated from a single, consistent thread, matching how
+    /// `stop()` and `reconcileRunningState()` already touch them.
+    ///
     /// - Parameter enableTUN: When `true` (the default — matches the previous
     ///   behavior of this method), the config is run as-authored. When `false`, any
     ///   `tun`-type inbound is stripped from a generated copy of the config before
@@ -81,32 +91,47 @@ final class SingBoxProcessManager {
     ///   never touching the TUN interface). Used by "Set as System Proxy" to
     ///   auto-start sing-box without also opting the user into Enhanced Mode.
     func start(configPath: String, enableTUN: Bool = true, completion: @escaping (Result<Void, Error>) -> Void) {
-        let (ok, output) = validateConfig(at: configPath)
-        guard ok else {
-            completion(.failure(SingBoxError.invalidConfig(output)))
-            return
-        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
 
-        guard hasPrivilegedAccess() else {
-            let msg = "Passwordless sudo isn't set up for sing-box yet. See README → \"One-time setup: passwordless sudo\", then try again."
-            AppLog.error(msg)
-            completion(.failure(SingBoxError.privilegeNotConfigured(msg)))
-            return
-        }
-
-        let runPath: String
-        if enableTUN {
-            runPath = configPath
-        } else {
-            switch Self.normalModeConfigPath(from: configPath) {
-            case .success(let path):
-                runPath = path
-            case .failure(let error):
-                completion(.failure(error))
+            let (ok, output) = self.validateConfig(at: configPath)
+            guard ok else {
+                DispatchQueue.main.async { completion(.failure(SingBoxError.invalidConfig(output))) }
                 return
             }
-        }
 
+            guard self.hasPrivilegedAccess() else {
+                let msg = "Passwordless sudo isn't set up for sing-box yet. See README → \"One-time setup: passwordless sudo\", then try again."
+                AppLog.error(msg)
+                DispatchQueue.main.async { completion(.failure(SingBoxError.privilegeNotConfigured(msg))) }
+                return
+            }
+
+            let runPath: String
+            if enableTUN {
+                runPath = configPath
+            } else {
+                switch Self.normalModeConfigPath(from: configPath) {
+                case .success(let path):
+                    runPath = path
+                case .failure(let error):
+                    DispatchQueue.main.async { completion(.failure(error)) }
+                    return
+                }
+            }
+
+            DispatchQueue.main.async {
+                self.finishStarting(runPath: runPath, enableTUN: enableTUN, completion: completion)
+            }
+        }
+    }
+
+    /// The process-spawning half of `start`, run on the main thread since it
+    /// mutates `process`/`isRunning`/`isTUNEnabled`. Everything here is local
+    /// (terminate-and-wait on an already-obedient child, then `Process.run()`) —
+    /// no network or config-parsing — so unlike validation it hasn't been a source
+    /// of the multi-second freezes this split was written to fix.
+    private func finishStarting(runPath: String, enableTUN: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
         let wasRunningBeforeRestart = isRunning
         stopQuietly() // ensure clean slate before starting a new instance — see stopQuietly's doc comment for why this doesn't fire onStateChange
 
@@ -125,7 +150,7 @@ final class SingBoxProcessManager {
             // we're not actually restarting anymore, so they still need to hear
             // about the now-genuine stop.
             if wasRunningBeforeRestart {
-                DispatchQueue.main.async { self.onStateChange?(false) }
+                onStateChange?(false)
             }
             return
         }
@@ -159,14 +184,14 @@ final class SingBoxProcessManager {
             self.isRunning = true
             self.isTUNEnabled = enableTUN
             AppLog.log("sing-box started (pid \(process.processIdentifier)) with config \(runPath)\(enableTUN ? "" : " [normal mode — TUN inbound disabled]")")
-            DispatchQueue.main.async { self.onStateChange?(true) }
+            onStateChange?(true)
             completion(.success(()))
         } catch {
             try? logHandle.close()
             AppLog.error("Failed to start sing-box: \(error.localizedDescription)")
             completion(.failure(error))
             if wasRunningBeforeRestart {
-                DispatchQueue.main.async { self.onStateChange?(false) }
+                onStateChange?(false)
             }
         }
     }
