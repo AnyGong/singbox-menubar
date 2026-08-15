@@ -38,6 +38,7 @@ enum Preferences {
         static let systemProxyEnabled = "systemProxyEnabled"
         static let launchAtLogin = "launchAtLogin"
         static let preferredNetworkService = "preferredNetworkService"
+        static let autoReloadOnConfigChange = "autoReloadOnConfigChange"
     }
 
     static var outboundMode: OutboundMode {
@@ -73,5 +74,16 @@ enum Preferences {
     static var profilesDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/sing-box", isDirectory: true)
+    }
+
+    /// Whether the app should reload the active configuration automatically when it
+    /// detects the file changed on disk (see `ConfigFileWatcher`), versus just
+    /// notifying and waiting for a manual "Reload Configuration". Off by default —
+    /// silently reloading whatever a file watcher noticed felt like the wrong
+    /// default for something that restarts a privileged process; opt in explicitly
+    /// via the "Auto Reload on Config Change" menu item.
+    static var autoReloadOnConfigChange: Bool {
+        get { defaults.bool(forKey: Keys.autoReloadOnConfigChange) }
+        set { defaults.set(newValue, forKey: Keys.autoReloadOnConfigChange) }
     }
 }

@@ -24,6 +24,8 @@ Sources/SingBoxMenuBar/
   IconRenderer.swift          — draws the base symbol + R/G/D badge
   LaunchAtLogin.swift         — SMAppService wrapper
   Logger.swift                — flat-file logging to ~/Library/Logs/singbox-menubar/
+  AppNotifier.swift           — posts macOS notifications for key state changes
+  ConfigFileWatcher.swift     — kqueue-based watcher for external edits to the active profile
 ```
 
 ## Quick run during development (no bundle)
@@ -144,6 +146,49 @@ If you skip this step, System Proxy will still work via an admin-password prompt
 time (the app falls back automatically), but Enhanced Mode/TUN will refuse to start and
 point you back to this section — a long-running process doesn't fall back to a prompt
 gracefully, so it requires the setup.
+
+## Notifications
+
+The app posts macOS notifications (via `UNUserNotificationCenter`, see
+`AppNotifier.swift`) for:
+
+- Outbound mode changed (Direct / Global / Rule), whether switched from the menu or
+  detected as changed externally via the Clash API
+- System Proxy enabled / disabled, from the menu, dangling-cleanup, or detected
+  externally via `networksetup`
+- Enhanced Mode (TUN) enabled / disabled
+- sing-box started / stopped, including unexpected exits (crashes) — shown as a
+  distinct "Stopped Unexpectedly" notification with the exit status
+- The active configuration file changing on disk outside the app (see below)
+
+These are local notifications only — no network calls, no third-party service — and
+are entirely best-effort: if you haven't granted the app notification permission (or
+have it disabled in System Settings → Notifications, or Focus/DND is on), they
+silently don't show, and nothing else about the app's behavior changes. The first
+launch will prompt for permission once; **on `swift run` (no bundle), macOS will
+likely refuse to authorize a bare binary, or the request may silently fail** — this
+is a `swift run`-only limitation, and is expected to resolve once you package the app
+per "Building a real .app bundle" above.
+
+Notifications for a given category (e.g. all "System Proxy" ones) replace each other
+rather than piling up, so rapid toggling won't spam Notification Center — you'll
+always just see the latest state.
+
+### Auto Reload on Config Change
+
+The app watches the active profile file for changes made outside it (hand-editing,
+a sync tool, a generator script, etc.) using a `DispatchSourceFileSystemObject`
+(no polling). Whenever it detects a change:
+
+- It always posts a "Configuration Changed" notification.
+- If the new **Auto Reload on Config Change** menu item (under the profile section,
+  next to "Reload Configuration") is **on**, it also reloads automatically — the
+  same restart-with-active-profile path as clicking "Reload Configuration" by hand.
+- If it's **off** (the default), it only notifies; you reload manually whenever
+  you're ready.
+
+This only does anything while sing-box is actually running that profile — if it's
+stopped, you just get the notification, since there's nothing to reload.
 
 ## Logs
 

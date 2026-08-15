@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tunItem = NSMenuItem()
     private var switchProfileItem = NSMenuItem()
     private var launchAtLoginItem = NSMenuItem()
+    private var autoReloadItem = NSMenuItem()
 
     private var currentSystemProxyService: String?
 
@@ -24,16 +25,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var stateSyncTimer: Timer?
     private static let stateSyncInterval: TimeInterval = 3
 
+    /// Watches the active profile file on disk and reports changes made outside
+    /// this app — see `handleExternalConfigChange` and the "Auto Reload on Config
+    /// Change" menu item.
+    private let configWatcher = ConfigFileWatcher()
+
+    /// Tracked separately from `processManager.isTUNEnabled` so the `onStateChange`
+    /// handler can tell whether TUN specifically changed (vs. just run state), since
+    /// it fires on every start/stop/restart, not only ones where TUN flipped.
+    private var lastKnownTUNEnabled = false
+
+    /// Set by `processManager.onUnexpectedExit`, immediately before `onStateChange`
+    /// fires for that same stop — consumed (and cleared) there to post a "crashed"
+    /// notification instead of a plain "stopped" one.
+    private var pendingCrashStatus: Int32?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.log("App launched")
+
+        AppNotifier.requestAuthorizationIfNeeded()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         buildMenu()
         refreshIcon()
 
+        lastKnownTUNEnabled = processManager.isTUNEnabled
+
+        configWatcher.onChange = { [weak self] path in
+            self?.handleExternalConfigChange(path)
+        }
+
+        processManager.onUnexpectedExit = { [weak self] status in
+            self?.pendingCrashStatus = status
+        }
+
         processManager.onStateChange = { [weak self] running in
             guard let self else { return }
-            self.tunItem.state = self.processManager.isTUNEnabled ? .on : .off
+
+            let tunNowEnabled = self.processManager.isTUNEnabled
+            if tunNowEnabled != self.lastKnownTUNEnabled {
+                self.lastKnownTUNEnabled = tunNowEnabled
+                AppNotifier.post(
+                    title: tunNowEnabled ? "Enhanced Mode (TUN) Enabled" : "Enhanced Mode (TUN) Disabled",
+                    body: tunNowEnabled ? "sing-box is now routing traffic through the TUN interface." : "TUN interface torn down.",
+                    identifier: "tun-mode"
+                )
+            }
+            self.tunItem.state = tunNowEnabled ? .on : .off
+
+            if let crashStatus = self.pendingCrashStatus, !running {
+                self.pendingCrashStatus = nil
+                AppNotifier.post(
+                    title: "sing-box Stopped Unexpectedly",
+                    body: "sing-box exited unexpectedly (status \(crashStatus)). Check sing-box.log for details.",
+                    identifier: "singbox-run-state"
+                )
+            } else {
+                AppNotifier.post(
+                    title: running ? "sing-box Started" : "sing-box Stopped",
+                    body: running ? "sing-box is now running." : "sing-box is no longer running.",
+                    identifier: "singbox-run-state"
+                )
+            }
+
             if running {
                 // A run just (genuinely) started — make sure System Proxy, if it's
                 // marked on, still has something to actually serve it. Covers TUN
@@ -56,6 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Preferences.activeProfilePath = ConfigManager.defaultProfile()?.path
         }
 
+        if let path = Preferences.activeProfilePath {
+            configWatcher.watch(path: path)
+        }
+
         // Catch up with reality immediately (e.g. sing-box was already running before
         // this app launched), then keep polling so later external changes are caught too.
         syncExternalState()
@@ -68,10 +126,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AppLog.log("App terminating — cleaning up")
         stateSyncTimer?.invalidate()
         stateSyncTimer = nil
+        configWatcher.stop()
         if let service = currentSystemProxyService, Preferences.systemProxyEnabled {
             SystemProxyManager.disable(service: service) { _ in }
         }
         processManager.stop()
+    }
+
+    // MARK: - External configuration-file changes
+
+    /// Invoked (on the main thread) by `configWatcher` when the active profile file
+    /// changes on disk outside this app. Always notifies; additionally reloads
+    /// automatically if the user has "Auto Reload on Config Change" enabled and
+    /// sing-box is actually running the file in question — otherwise it just waits
+    /// for a manual "Reload Configuration", per the feature's spec.
+    private func handleExternalConfigChange(_ path: String) {
+        // Guards against a stale/in-flight watcher callback racing a profile switch
+        // that happened in the meantime.
+        guard path == Preferences.activeProfilePath else { return }
+        let name = (path as NSString).lastPathComponent
+        AppLog.log("Detected external change to active configuration '\(name)'")
+
+        guard processManager.isRunning else {
+            // Nothing is currently serving this config, so there's nothing to
+            // reload — just let the user know the file on disk changed.
+            AppNotifier.post(
+                title: "Configuration Changed",
+                body: "\(name) changed on disk.",
+                identifier: "config-change"
+            )
+            return
+        }
+
+        if Preferences.autoReloadOnConfigChange {
+            AppNotifier.post(
+                title: "Configuration Changed",
+                body: "\(name) changed on disk. Reloading automatically…",
+                identifier: "config-change"
+            )
+            reloadConfiguration()
+        } else {
+            AppNotifier.post(
+                title: "Configuration Changed",
+                body: "\(name) changed on disk. Reload it from the menu to apply, or enable Auto Reload on Config Change.",
+                identifier: "config-change"
+            )
+        }
     }
 
     // MARK: - External state sync
@@ -112,6 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.outboundModeItem.submenu?.items.forEach {
                 $0.state = ($0.representedObject as? OutboundMode) == mode ? .on : .off
             }
+            AppNotifier.post(
+                title: "Outbound Mode Changed",
+                body: "Now using \(mode.rawValue) mode.",
+                identifier: "outbound-mode"
+            )
             self.refreshIcon()
         }
     }
@@ -126,6 +231,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Preferences.systemProxyEnabled = actuallyEnabled
                 self.currentSystemProxyService = actuallyEnabled ? service : nil
                 self.systemProxyItem.state = actuallyEnabled ? .on : .off
+                AppNotifier.post(
+                    title: actuallyEnabled ? "System Proxy Enabled" : "System Proxy Disabled",
+                    body: actuallyEnabled ? "Enabled externally for '\(service)'." : "Disabled externally for '\(service)'.",
+                    identifier: "system-proxy"
+                )
                 self.refreshIcon()
             }
         }
@@ -185,6 +295,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Preferences.systemProxyEnabled = false
             self.currentSystemProxyService = nil
             self.systemProxyItem.state = .off
+            AppNotifier.post(
+                title: "System Proxy Disabled",
+                body: alertMessage ?? "System Proxy has been turned off for '\(service)'.",
+                identifier: "system-proxy"
+            )
             self.refreshIcon()
             if let alertMessage {
                 self.showNonBlockingAlert(title: "System Proxy Turned Off", message: alertMessage)
@@ -268,6 +383,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "")
         .target = self
 
+        // Governs how external changes to the active profile file are handled — see
+        // `handleExternalConfigChange`. Off by default: notify and wait for a
+        // manual reload rather than restarting a privileged process unprompted.
+        autoReloadItem.title = "Auto Reload on Config Change"
+        autoReloadItem.action = #selector(toggleAutoReloadOnConfigChange)
+        autoReloadItem.target = self
+        autoReloadItem.state = Preferences.autoReloadOnConfigChange ? .on : .off
+        menu.addItem(autoReloadItem)
+
         menu.addItem(.separator())
 
         launchAtLoginItem.title = "Launch at Login"
@@ -341,11 +465,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectMode(_ sender: NSMenuItem) {
         guard let mode = sender.representedObject as? OutboundMode else { return }
+        let changed = mode != Preferences.outboundMode
         Preferences.outboundMode = mode
         outboundModeItem.title = "Outbound Mode  (\(mode.badgeLetter))"
         outboundModeItem.submenu?.items.forEach { $0.state = ($0.representedObject as? OutboundMode) == mode ? .on : .off }
         refreshIcon()
         AppLog.log("Outbound mode preference set to \(mode.rawValue)")
+        if changed {
+            AppNotifier.post(
+                title: "Outbound Mode Changed",
+                body: "Now using \(mode.rawValue) mode.",
+                identifier: "outbound-mode"
+            )
+        }
 
         if processManager.isRunning {
             ClashAPIClient.shared.setMode(mode) { result in
@@ -362,6 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let service = currentSystemProxyService else {
                 Preferences.systemProxyEnabled = false
                 systemProxyItem.state = .off
+                AppNotifier.post(title: "System Proxy Disabled", body: "System Proxy has been turned off.", identifier: "system-proxy")
                 refreshIcon()
                 return
             }
@@ -372,6 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     Preferences.systemProxyEnabled = false
                     self.systemProxyItem.state = .off
                     self.currentSystemProxyService = nil
+                    AppNotifier.post(title: "System Proxy Disabled", body: "Disabled for '\(service)'.", identifier: "system-proxy")
                     self.refreshIcon()
                 case .failure(let error):
                     self.handleSystemProxyError(error)
@@ -458,6 +592,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Preferences.systemProxyEnabled = true
                 self.currentSystemProxyService = service
                 self.systemProxyItem.state = .on
+                AppNotifier.post(
+                    title: "System Proxy Enabled",
+                    body: "Enabled for '\(service)'.",
+                    identifier: "system-proxy"
+                )
                 self.refreshIcon()
             case .failure(let error):
                 self.handleSystemProxyError(error)
@@ -512,6 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wasTUNEnabled = processManager.isTUNEnabled
         Preferences.activeProfilePath = url.path
         rebuildProfileSubmenu()
+        configWatcher.watch(path: url.path)
         AppLog.log("Active profile switched to \(url.lastPathComponent)")
 
         if wasRunning {
@@ -557,6 +697,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// point for that same path, which also drives the icon/status line update.
     @objc private func stopSingBoxManually() {
         processManager.stop()
+    }
+
+    @objc private func toggleAutoReloadOnConfigChange() {
+        let newValue = !Preferences.autoReloadOnConfigChange
+        Preferences.autoReloadOnConfigChange = newValue
+        autoReloadItem.state = newValue ? .on : .off
+        AppLog.log("Auto Reload on Config Change \(newValue ? "enabled" : "disabled")")
     }
 
     @objc private func toggleLaunchAtLogin() {

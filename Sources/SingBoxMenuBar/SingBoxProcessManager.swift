@@ -21,6 +21,14 @@ final class SingBoxProcessManager {
     /// Called on the main thread whenever run state changes (started, stopped, crashed).
     var onStateChange: ((Bool) -> Void)?
 
+    /// Called on the main thread, immediately before `onStateChange(false)`, only
+    /// when the process that just stopped exited on its own with a non-zero status
+    /// (i.e. crashed or was killed) rather than being deliberately stopped by this
+    /// app. Lets observers (see AppDelegate) distinguish "sing-box stopped" from
+    /// "sing-box crashed" for notification purposes without needing to inspect
+    /// termination status themselves.
+    var onUnexpectedExit: ((Int32) -> Void)?
+
     // MARK: - Validation
 
     /// Runs `sing-box check -c <config>` synchronously and returns (isValid, output).
@@ -136,6 +144,7 @@ final class SingBoxProcessManager {
                 if wasRunning {
                     if proc.terminationStatus != 0 {
                         AppLog.error("sing-box exited unexpectedly (status \(proc.terminationStatus)). See sing-box.log.")
+                        self.onUnexpectedExit?(proc.terminationStatus)
                     } else {
                         AppLog.log("sing-box exited cleanly.")
                     }
