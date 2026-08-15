@@ -26,6 +26,7 @@ Sources/SingBoxMenuBar/
   Logger.swift                — flat-file logging to ~/Library/Logs/singbox-menubar/
   AppNotifier.swift           — posts macOS notifications for key state changes
   ConfigFileWatcher.swift     — kqueue-based watcher for external edits to the active profile
+  RemoteConfigUpdater.swift   — downloads/validates/installs a remote config on a schedule
 ```
 
 ## Quick run during development (no bundle)
@@ -189,6 +190,37 @@ a sync tool, a generator script, etc.) using a `DispatchSourceFileSystemObject`
 
 This only does anything while sing-box is actually running that profile — if it's
 stopped, you just get the notification, since there's nothing to reload.
+
+## Remote Config Auto-Update
+
+The **Remote Config** submenu (next to "Auto Reload on Config Change") lets the app
+periodically download a config from a URL you set:
+
+- **Set Remote URL…** — enter the URL. Clear the field to turn the feature off.
+- **Update Interval** — Off / Hourly / Every 6 Hours / Daily / Weekly. Scheduling
+  survives app restarts: if the app was quit past the last update's interval, it
+  catches up immediately on next launch instead of waiting a full extra cycle.
+- **Update Now** — fetches immediately, regardless of the schedule.
+
+Every download always lands at the same fixed path, `remote-config.json` inside the
+profiles directory (`Open Config Folder`), where it shows up under **Switch
+Profile** like any hand-authored config. The submenu only controls *fetching* it —
+whether/when it's actually used is the same "select it under Switch Profile" flow
+as any other profile.
+
+Before a download is ever allowed to touch that file, it's validated: parsed as
+JSON, written to a temp file, and run through `sing-box check`. If any of that
+fails — network error, bad HTTP status, invalid JSON, a config that fails
+validation — you get a "Remote Config Update Failed" alert with the reason, and the
+existing `remote-config.json` (if any) is left completely untouched.
+
+On success, what happens next depends on whether `remote-config.json` happens to be
+the *active* profile:
+- **If it is**, the download is picked up by the same file watcher behind "Auto
+  Reload on Config Change" above — so it reloads automatically or just notifies,
+  based on that same setting.
+- **If it isn't**, you get a "Remote Config Updated" notification letting you know
+  a fresh version is ready whenever you want to switch to it.
 
 ## Logs
 
