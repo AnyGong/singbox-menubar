@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var switchProfileItem = NSMenuItem()
     private var launchAtLoginItem = NSMenuItem()
     private var autoReloadItem = NSMenuItem()
+    private var remoteConfigItem = NSMenuItem()
 
     private var currentSystemProxyService: String?
 
@@ -115,6 +116,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             configWatcher.watch(path: path)
         }
 
+        RemoteConfigUpdater.shared.onResult = { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                // No notification of our own here — writing the new config over the
+                // active profile file is exactly what `configWatcher` is watching
+                // for, and it (via `handleExternalConfigChange`) already posts a
+                // notification and either auto-reloads or waits for a manual
+                // reload, per "Auto Reload on Config Change". Posting a second,
+                // separate notification here would just be noise.
+                AppLog.log("Remote config check succeeded")
+            case .failure(let error):
+                if case RemoteConfigError.notConfigured = error {
+                    // Only reachable from the manual "Update Now" action — a
+                    // scheduled tick can't fire without both a URL and an interval
+                    // configured (see `reschedule`) — so this is worth telling the
+                    // user about, not a silent no-op.
+                    self.showNonBlockingAlert(title: "Remote Config Not Set Up", message: error.localizedDescription)
+                } else {
+                    self.showNonBlockingAlert(title: "Remote Config Update Failed", message: error.localizedDescription)
+                }
+            }
+        }
+        RemoteConfigUpdater.shared.reschedule()
+
         // Catch up with reality immediately (e.g. sing-box was already running before
         // this app launched), then keep polling so later external changes are caught too.
         syncExternalState()
@@ -128,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stateSyncTimer?.invalidate()
         stateSyncTimer = nil
         configWatcher.stop()
+        RemoteConfigUpdater.shared.stop()
         if let service = currentSystemProxyService, Preferences.systemProxyEnabled {
             SystemProxyManager.disable(service: service) { _ in }
         }
@@ -385,6 +412,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildProfileSubmenu()
         menu.addItem(switchProfileItem)
 
+        // Work regardless of run state — opening the folder or an editor doesn't
+        // touch sing-box at all, so neither is gated on `processManager.isRunning`.
+        menu.addItem(withTitle: "Open Config Folder", action: #selector(openConfigFolder), keyEquivalent: "")
+        .target = self
+
+        menu.addItem(withTitle: "Edit Current Config", action: #selector(editCurrentConfig), keyEquivalent: "")
+        .target = self
+
         menu.addItem(withTitle: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "")
         .target = self
 
@@ -396,6 +431,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoReloadItem.target = self
         autoReloadItem.state = Preferences.autoReloadOnConfigChange ? .on : .off
         menu.addItem(autoReloadItem)
+
+        // Remote Config submenu — a periodic downloader that writes over the
+        // active profile file (see RemoteConfigUpdater); what happens after a
+        // successful write is governed by the same Auto Reload setting above.
+        remoteConfigItem.title = "Remote Config"
+        rebuildRemoteConfigSubmenu()
+        menu.addItem(remoteConfigItem)
 
         menu.addItem(.separator())
 
@@ -430,6 +472,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             submenu.addItem(item)
         }
         switchProfileItem.submenu = submenu
+    }
+
+    /// Rebuilds the Remote Config submenu from current preferences — called at
+    /// menu construction and again whenever the URL or interval changes, same
+    /// pattern as `rebuildProfileSubmenu`.
+    private func rebuildRemoteConfigSubmenu() {
+        let submenu = NSMenu()
+
+        let urlTitle: String
+        if let url = Preferences.remoteConfigURL, !url.isEmpty {
+            urlTitle = "URL: \(url)"
+        } else {
+            urlTitle = "URL: Not Set"
+        }
+        let urlDisplayItem = NSMenuItem(title: urlTitle, action: nil, keyEquivalent: "")
+        urlDisplayItem.isEnabled = false
+        submenu.addItem(urlDisplayItem)
+
+        let setURLItem = NSMenuItem(title: "Set Remote Config URL…", action: #selector(setRemoteConfigURL), keyEquivalent: "")
+        setURLItem.target = self
+        submenu.addItem(setURLItem)
+
+        submenu.addItem(.separator())
+
+        for interval in RemoteConfigInterval.allCases {
+            let item = NSMenuItem(title: interval.rawValue, action: #selector(selectRemoteConfigInterval(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = interval
+            item.state = (interval == Preferences.remoteConfigInterval) ? .on : .off
+            submenu.addItem(item)
+        }
+
+        submenu.addItem(.separator())
+
+        let updateNowItem = NSMenuItem(title: "Update Now", action: #selector(updateRemoteConfigNow), keyEquivalent: "")
+        updateNowItem.target = self
+        submenu.addItem(updateNowItem)
+
+        remoteConfigItem.submenu = submenu
     }
 
     private func refreshIcon() {
@@ -669,6 +750,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Opens the profiles directory in Finder — works whether or not sing-box is
+    /// running, and regardless of whether a profile is currently selected. Creates
+    /// the directory first if it doesn't exist yet, so a first-run user gets a real
+    /// folder to drop configs into rather than Finder silently failing to open one.
+    @objc private func openConfigFolder() {
+        let dir = Preferences.profilesDirectory
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
+    /// Opens the active profile file with whatever app macOS has associated with
+    /// its extension (a text editor for the .yaml/.json profiles this app deals
+    /// in). Works regardless of sing-box's run state — editing a config doesn't
+    /// require sing-box to be running, and doesn't touch it either; use "Reload
+    /// Configuration" afterward to apply changes.
+    @objc private func editCurrentConfig() {
+        guard let path = Preferences.activeProfilePath else {
+            showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first.")
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
     @objc private func reloadConfiguration() {
         guard let path = Preferences.activeProfilePath else { return }
         // Same mode it was already running in — reload shouldn't change that.
@@ -704,6 +808,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Preferences.autoReloadOnConfigChange = newValue
         autoReloadItem.state = newValue ? .on : .off
         AppLog.log("Auto Reload on Config Change \(newValue ? "enabled" : "disabled")")
+    }
+
+    @objc private func setRemoteConfigURL() {
+        let alert = NSAlert()
+        alert.messageText = "Remote Config URL"
+        alert.informativeText = "Enter the URL sing-box's config should be downloaded from on the schedule below. Leave blank to disable remote updates."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.stringValue = Preferences.remoteConfigURL ?? ""
+        field.placeholderString = "https://example.com/config.json"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        Preferences.remoteConfigURL = trimmed.isEmpty ? nil : trimmed
+        AppLog.log(trimmed.isEmpty ? "Remote config URL cleared" : "Remote config URL set")
+        rebuildRemoteConfigSubmenu()
+        RemoteConfigUpdater.shared.reschedule()
+    }
+
+    @objc private func selectRemoteConfigInterval(_ sender: NSMenuItem) {
+        guard let interval = sender.representedObject as? RemoteConfigInterval else { return }
+        Preferences.remoteConfigInterval = interval
+        rebuildRemoteConfigSubmenu()
+        RemoteConfigUpdater.shared.reschedule()
+        AppLog.log("Remote config update interval set to \(interval.rawValue)")
+    }
+
+    /// Feedback for both this and any scheduled checks arrives via
+    /// `RemoteConfigUpdater.onResult`, wired once in `applicationDidFinishLaunching`.
+    @objc private func updateRemoteConfigNow() {
+        RemoteConfigUpdater.shared.checkNow()
     }
 
     @objc private func toggleLaunchAtLogin() {

@@ -29,6 +29,23 @@ enum OutboundMode: String, CaseIterable {
     }
 }
 
+enum RemoteConfigInterval: String, CaseIterable {
+    case off = "Off"
+    case hourly = "Hourly"
+    case daily = "Daily"
+    case weekly = "Weekly"
+
+    /// `nil` for `.off` — the updater treats that as "don't schedule anything".
+    var timeInterval: TimeInterval? {
+        switch self {
+        case .off: return nil
+        case .hourly: return 3600
+        case .daily: return 86400
+        case .weekly: return 604800
+        }
+    }
+}
+
 enum Preferences {
     private static let defaults = UserDefaults.standard
 
@@ -39,6 +56,8 @@ enum Preferences {
         static let launchAtLogin = "launchAtLogin"
         static let preferredNetworkService = "preferredNetworkService"
         static let autoReloadOnConfigChange = "autoReloadOnConfigChange"
+        static let remoteConfigURL = "remoteConfigURL"
+        static let remoteConfigInterval = "remoteConfigInterval"
     }
 
     static var outboundMode: OutboundMode {
@@ -73,7 +92,7 @@ enum Preferences {
     /// Directory scanned for available profile .yaml/.json files (Switch Profile submenu).
     static var profilesDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/sing-box", isDirectory: true)
+        .appendingPathComponent(".config/sing-box", isDirectory: true)
     }
 
     /// Whether the app should reload the active configuration automatically when it
@@ -85,5 +104,25 @@ enum Preferences {
     static var autoReloadOnConfigChange: Bool {
         get { defaults.bool(forKey: Keys.autoReloadOnConfigChange) }
         set { defaults.set(newValue, forKey: Keys.autoReloadOnConfigChange) }
+    }
+
+    /// URL sing-box's config is downloaded from on the schedule below. `nil`/empty
+    /// means remote auto-update is unconfigured, independent of the interval
+    /// setting — both must be set for `RemoteConfigUpdater` to actually schedule
+    /// anything (see `RemoteConfigUpdater.reschedule`).
+    static var remoteConfigURL: String? {
+        get { defaults.string(forKey: Keys.remoteConfigURL) }
+        set { defaults.set(newValue, forKey: Keys.remoteConfigURL) }
+    }
+
+    static var remoteConfigInterval: RemoteConfigInterval {
+        get {
+            guard let raw = defaults.string(forKey: Keys.remoteConfigInterval),
+                  let interval = RemoteConfigInterval(rawValue: raw) else {
+                return .off // default: no auto-update until explicitly configured
+            }
+            return interval
+        }
+        set { defaults.set(newValue.rawValue, forKey: Keys.remoteConfigInterval) }
     }
 }
