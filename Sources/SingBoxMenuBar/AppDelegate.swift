@@ -6,6 +6,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let processManager = SingBoxProcessManager.shared
 
     // Menu items kept as properties so we can update their checkmarks/titles in place.
+    private var statusLineItem = NSMenuItem()
+    private var restartSingBoxItem = NSMenuItem()
+    private var stopSingBoxItem = NSMenuItem()
     private var outboundModeItem = NSMenuItem()
     private var systemProxyItem = NSMenuItem()
     private var tunItem = NSMenuItem()
@@ -31,7 +34,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         processManager.onStateChange = { [weak self] running in
             guard let self else { return }
             self.tunItem.state = self.processManager.isTUNEnabled ? .on : .off
-            if !running {
+            if running {
+                // A run just (genuinely) started — make sure System Proxy, if it's
+                // marked on, still has something to actually serve it. Covers TUN
+                // being enabled (config may or may not also keep a mixed/http/socks
+                // inbound — see reconcileSystemProxyCapability) as well as profile
+                // switches and reloads.
+                if let path = Preferences.activeProfilePath {
+                    self.reconcileSystemProxyCapability(configPath: path)
+                }
+            } else {
                 self.disableSystemProxyIfDangling()
             }
             self.refreshIcon()
@@ -120,17 +132,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// System Proxy only does anything useful while sing-box is actually running and
-    /// listening on the proxy port — see `toggleSystemProxy`, which auto-starts
-    /// sing-box (in normal, no-TUN mode) rather than requiring that separately. This
-    /// is the other half of that invariant: if sing-box stops (deliberately via
-    /// Enhanced Mode, a crash, or externally) while System Proxy is still marked on,
-    /// turn it back off rather than leaving traffic pointed at a dead port while the
-    /// menu bar keeps showing a checkmark.
+    /// listening on a proxy-capable inbound — see `toggleSystemProxy`, which
+    /// auto-starts sing-box (in normal, no-TUN mode) rather than requiring that
+    /// separately, and blocks enabling System Proxy for a config with no such
+    /// inbound in the first place. This is the "sing-box isn't running at all"
+    /// half of that invariant: if sing-box stops (deliberately, a crash, or
+    /// externally) while System Proxy is still marked on, turn it back off rather
+    /// than leaving traffic pointed at a dead port while the menu bar keeps
+    /// showing a checkmark. See `reconcileSystemProxyCapability` for the other
+    /// half — sing-box still running, but its *current* config no longer has an
+    /// inbound to serve System Proxy with.
     private func disableSystemProxyIfDangling() {
+        disableSystemProxy()
+    }
+
+    /// While sing-box is running, checks whether `configPath` — the config it was
+    /// just (re)started with — still has an inbound System Proxy can point at
+    /// (`mixed`/`http`/`socks`). If System Proxy is enabled and it doesn't, turns
+    /// it off and tells the user why, rather than leaving a checkmark on a proxy
+    /// setting pointed at nothing.
+    ///
+    /// If the config *does* have one — the common case, e.g. enabling TUN on a
+    /// config that also keeps its mixed/http/socks inbound — this deliberately
+    /// does nothing: System Proxy stays exactly as it was, so it coexists with
+    /// Enhanced Mode instead of being dropped as a side effect of the restart.
+    private func reconcileSystemProxyCapability(configPath: String) {
+        guard Preferences.systemProxyEnabled,
+              !SingBoxProcessManager.hasProxyCapableInbound(at: configPath) else { return }
+        AppLog.log("'\((configPath as NSString).lastPathComponent)' has no mixed/http/socks inbound while System Proxy is enabled; disabling it")
+        disableSystemProxy(alertMessage: "\((configPath as NSString).lastPathComponent) has no mixed/http/socks inbound anymore, so System Proxy has nothing to connect to. It's been turned off.")
+    }
+
+    /// Turns System Proxy off and syncs menu bar/preference state to match.
+    /// `alertMessage`, if given, is shown to the user — use it when disabling
+    /// something they'd reasonably expect to still be working (config no longer
+    /// serves a proxy inbound); omit it for the unsurprising case of sing-box
+    /// simply not running at all.
+    private func disableSystemProxy(alertMessage: String? = nil) {
         guard Preferences.systemProxyEnabled,
               let service = currentSystemProxyService ?? Preferences.preferredNetworkService else { return }
 
-        AppLog.log("sing-box is not running while System Proxy is enabled for '\(service)'; disabling System Proxy")
+        AppLog.log("Disabling System Proxy for '\(service)'")
         SystemProxyManager.disable(service: service) { [weak self] result in
             guard let self else { return }
             if case .failure(let error) = result {
@@ -144,6 +186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.currentSystemProxyService = nil
             self.systemProxyItem.state = .off
             self.refreshIcon()
+            if let alertMessage {
+                self.showNonBlockingAlert(title: "System Proxy Turned Off", message: alertMessage)
+            }
         }
     }
 
@@ -151,6 +196,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func buildMenu() {
         let menu = NSMenu()
+
+        // Status line: reflects current sing-box state ("Running · Normal mode" /
+        // "Running · TUN mode" / "Stopped"). No action/target of its own — clicking
+        // it just reveals the submenu below, same as any other AppKit menu item with
+        // a submenu. Kept in sync by `updateStatusLine`, called from `refreshIcon`.
+        let advancedActionsSubmenu = NSMenu()
+
+        restartSingBoxItem.title = "Restart sing-box"
+        restartSingBoxItem.action = #selector(restartSingBox)
+        restartSingBoxItem.target = self
+        advancedActionsSubmenu.addItem(restartSingBoxItem)
+
+        stopSingBoxItem.title = "Stop sing-box"
+        stopSingBoxItem.action = #selector(stopSingBoxManually)
+        stopSingBoxItem.target = self
+        advancedActionsSubmenu.addItem(stopSingBoxItem)
+
+        advancedActionsSubmenu.addItem(.separator())
+
+        advancedActionsSubmenu.addItem(withTitle: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
+        .target = self
+
+        statusLineItem.submenu = advancedActionsSubmenu
+        menu.addItem(statusLineItem)
+
+        menu.addItem(.separator())
 
         menu.addItem(withTitle: "Show Main Window", action: #selector(showMainWindow), keyEquivalent: "")
         .target = self
@@ -207,11 +278,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        menu.addItem(withTitle: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
-        .target = self
-
-        menu.addItem(.separator())
-
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         .target = self
 
@@ -240,6 +306,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshIcon() {
         let active = processManager.isRunning || Preferences.systemProxyEnabled
         statusItem.button?.image = IconRenderer.makeIcon(mode: Preferences.outboundMode, active: active)
+        updateStatusLine()
+    }
+
+    /// Keeps the status line's title, and the enabled state of its Restart/Stop
+    /// actions, in sync with reality. Deliberately folded into `refreshIcon` rather
+    /// than given its own scattered call sites — `refreshIcon` already runs from
+    /// every internal action AND from the periodic/on-menu-open external-state sync
+    /// (see `syncExternalState`), so piggybacking on it is what makes the status
+    /// line track external changes (sing-box started/stopped/reconfigured outside
+    /// this app) in real time too, without duplicating those triggers here.
+    private func updateStatusLine() {
+        if processManager.isRunning {
+            let mode = processManager.isTUNEnabled ? "TUN mode" : "Normal mode"
+            statusLineItem.title = "sing-box: Running · \(mode)"
+        } else {
+            statusLineItem.title = "sing-box: Stopped"
+        }
+        restartSingBoxItem.isEnabled = processManager.isRunning
+        stopSingBoxItem.isEnabled = processManager.isRunning
     }
 
     // MARK: - Actions
@@ -293,16 +378,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         } else {
-            // System Proxy routes traffic to sing-box's local HTTP inbound, so it
-            // needs sing-box actually running. If it isn't, start it ourselves in
-            // normal mode — the active profile's config, with the TUN inbound left
-            // disabled — rather than erroring and making the user start it by hand
-            // first. Enhanced Mode (TUN) stays a separate, explicit opt-in.
+            // System Proxy routes traffic to a mixed/http/socks inbound in sing-box's
+            // config, so it needs both sing-box running AND that inbound to actually
+            // exist — a TUN-only config has nothing for it to connect to. Check that
+            // up front and block with a clear message rather than silently enabling
+            // a setting that won't do anything.
+            guard let path = Preferences.activeProfilePath else {
+                showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first, then try again.")
+                return
+            }
+            guard SingBoxProcessManager.hasProxyCapableInbound(at: path) else {
+                showNonBlockingAlert(
+                    title: "No Proxy Inbound in Config",
+                    message: "\((path as NSString).lastPathComponent) has no mixed/http/socks inbound, so there's nothing for System Proxy to connect to. Add one to the profile, then try again."
+                )
+                return
+            }
+
+            // Config supports it — start sing-box ourselves in normal mode (TUN left
+            // disabled) if it isn't running yet, rather than erroring and making the
+            // user start it by hand first. Enhanced Mode (TUN) stays a separate,
+            // explicit opt-in, and — since we already confirmed a proxy-capable
+            // inbound is present — the two can coexist: turning TUN on later won't
+            // disable this (see reconcileSystemProxyCapability).
             guard processManager.isRunning else {
-                guard let path = Preferences.activeProfilePath else {
-                    showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first, then try again.")
-                    return
-                }
                 processManager.start(configPath: path, enableTUN: false) { [weak self] result in
                     guard let self else { return }
                     switch result {
@@ -397,6 +496,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectProfile(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+
+        // Preflight validation before switching anything — an invalid profile
+        // shouldn't become "active" in the menu/Preferences, and definitely
+        // shouldn't touch a currently-running sing-box, just because it was
+        // clicked. Covers the case where sing-box isn't running yet too, where
+        // otherwise nothing would validate this config until some later start.
+        let (ok, output) = processManager.validateConfig(at: url.path)
+        guard ok else {
+            showNonBlockingAlert(title: "Invalid Configuration", message: "\(url.lastPathComponent) failed validation:\n\(output)")
+            return
+        }
+
         let wasRunning = processManager.isRunning
         let wasTUNEnabled = processManager.isTUNEnabled
         Preferences.activeProfilePath = url.path
@@ -406,7 +517,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if wasRunning {
             // Preserve whatever mode was already active (normal vs. TUN) rather than
             // defaulting to TUN — a profile switch shouldn't silently turn Enhanced
-            // Mode on for someone who was only using System Proxy.
+            // Mode on for someone who was only using System Proxy. `start` validates
+            // again internally, which is redundant here but harmless — it's the
+            // single source of truth for "is this config OK to run" and every start
+            // path goes through it.
             processManager.start(configPath: url.path, enableTUN: wasTUNEnabled) { [weak self] result in
                 if case .failure(let error) = result {
                     self?.showNonBlockingAlert(title: "Profile Switch Failed", message: error.localizedDescription)
@@ -426,6 +540,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.showNonBlockingAlert(title: "Reload Failed", message: error.localizedDescription)
             }
         }
+    }
+
+    /// Manual control from the status line's Advanced Actions submenu. Currently
+    /// the same operation as "Reload Configuration" (restart with the active
+    /// profile, preserving normal-vs-TUN mode) — exposed again here, disabled
+    /// unless sing-box is actually running, alongside Stop for discoverability.
+    @objc private func restartSingBox() {
+        reloadConfiguration()
+    }
+
+    /// Manual control from the status line's Advanced Actions submenu.
+    /// `processManager.stop()` already disables System Proxy
+    /// (`disableSystemProxyIfDangling`, via `onStateChange`) and clears TUN state
+    /// as part of a genuine stop — this is just the explicit, user-facing entry
+    /// point for that same path, which also drives the icon/status line update.
+    @objc private func stopSingBoxManually() {
+        processManager.stop()
     }
 
     @objc private func toggleLaunchAtLogin() {

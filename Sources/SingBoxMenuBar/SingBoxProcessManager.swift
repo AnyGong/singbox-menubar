@@ -99,7 +99,8 @@ final class SingBoxProcessManager {
             }
         }
 
-        stop() // ensure clean slate before starting a new instance
+        let wasRunningBeforeRestart = isRunning
+        stopQuietly() // ensure clean slate before starting a new instance — see stopQuietly's doc comment for why this doesn't fire onStateChange
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
@@ -111,6 +112,13 @@ final class SingBoxProcessManager {
         FileManager.default.createFile(atPath: AppLog.singBoxLogURL.path, contents: nil)
         guard let logHandle = try? FileHandle(forWritingTo: AppLog.singBoxLogURL) else {
             completion(.failure(SingBoxError.logFileUnavailable))
+            // stopQuietly() above already tore down any previous instance without
+            // notifying observers (that's the point, for a normal restart) — but
+            // we're not actually restarting anymore, so they still need to hear
+            // about the now-genuine stop.
+            if wasRunningBeforeRestart {
+                DispatchQueue.main.async { self.onStateChange?(false) }
+            }
             return
         }
         process.standardOutput = logHandle
@@ -148,7 +156,30 @@ final class SingBoxProcessManager {
             try? logHandle.close()
             AppLog.error("Failed to start sing-box: \(error.localizedDescription)")
             completion(.failure(error))
+            if wasRunningBeforeRestart {
+                DispatchQueue.main.async { self.onStateChange?(false) }
+            }
         }
+    }
+
+    /// Stops the running process, if any, WITHOUT notifying `onStateChange`. Used
+    /// internally by `start` to clear out a previous instance immediately before
+    /// launching its replacement — that's an implementation detail of a restart, not
+    /// a real stop, and firing `onStateChange(false)` here would make callers like
+    /// `disableSystemProxyIfDangling` think sing-box had genuinely gone away and act
+    /// accordingly (e.g. turning off System Proxy) purely because of the brief gap
+    /// mid-restart, even when the new config keeps serving it just fine — see
+    /// requirements: enabling TUN must not disable System Proxy when the config
+    /// still has a mixed/HTTP/SOCKS inbound.
+    private func stopQuietly() {
+        guard let process, isRunning else { return }
+        AppLog.log("Stopping sing-box (pid \(process.processIdentifier)) to restart with new config/mode")
+        process.terminationHandler = nil // avoid double-firing our async handler above
+        process.terminate()
+        process.waitUntilExit()
+        self.process = nil
+        self.isRunning = false
+        self.isTUNEnabled = false
     }
 
     // MARK: - Normal-mode (no-TUN) config generation
@@ -224,6 +255,26 @@ final class SingBoxProcessManager {
         }
     }
 
+    /// Whether `configPath`'s `inbounds` array has at least one entry System Proxy
+    /// can actually point at — `mixed`, `http`, or `socks` — independent of whether
+    /// a `tun` inbound is *also* present. This is what determines whether System
+    /// Proxy and Enhanced Mode (TUN) can coexist for a given config: see
+    /// `AppDelegate.toggleSystemProxy`, which blocks enabling System Proxy without
+    /// one, and `AppDelegate.reconcileSystemProxyCapability`, which catches one
+    /// disappearing later (e.g. after a profile switch) while System Proxy is on.
+    ///
+    /// Best-effort: an unreadable or non-JSON config is treated as "no such
+    /// inbound" (fails closed), same as `normalModeConfigPath` above.
+    static func hasProxyCapableInbound(at configPath: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let inbounds = json["inbounds"] as? [[String: Any]] else {
+            return false
+        }
+        let proxyCapableTypes: Set<String> = ["mixed", "http", "socks"]
+        return inbounds.contains { ($0["type"] as? String).map { proxyCapableTypes.contains($0.lowercased()) } ?? false }
+    }
+
     /// Best-effort check for whether *a* sing-box process is alive on this machine,
     /// regardless of whether this app is the one that launched it. Synchronous and
     /// cheap enough to run on a timer; callers should still hop off the main thread
@@ -261,20 +312,17 @@ final class SingBoxProcessManager {
         onStateChange?(actuallyRunning)
     }
 
-    /// Terminates the running process, if any. Safe to call when nothing is running.
+    /// Terminates the running process, if any, and notifies `onStateChange(false)` —
+    /// this is a genuine, deliberate stop (Quit, "disable Enhanced Mode", etc.), as
+    /// opposed to `stopQuietly`'s use inside `start` for a transient restart. Safe to
+    /// call when nothing is running.
     /// Note: `process` here is the `sudo` wrapper, not sing-box itself — sudo forwards
     /// SIGTERM to its child by default, so this still shuts sing-box down cleanly. If
     /// you ever notice an orphaned sing-box process surviving Quit, check
     /// `ps aux | grep sing-box` and let me know.
     func stop() {
-        guard let process, isRunning else { return }
-        AppLog.log("Stopping sing-box (pid \(process.processIdentifier))")
-        process.terminationHandler = nil // avoid double-firing our async handler above
-        process.terminate()
-        process.waitUntilExit()
-        self.process = nil
-        self.isRunning = false
-        self.isTUNEnabled = false
+        guard isRunning else { return }
+        stopQuietly()
         onStateChange?(false)
     }
 }
