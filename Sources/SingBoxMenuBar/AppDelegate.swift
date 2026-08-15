@@ -557,7 +557,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshIcon() {
-        let active = processManager.isRunning || Preferences.systemProxyEnabled
+        // Active means "traffic is actually being routed through something the user
+        // turned on" — System Proxy or Enhanced Mode (TUN) — not just "sing-box
+        // happens to be running." sing-box can be up in plain normal mode (e.g.
+        // auto-started, or left running after disabling both) with nothing actually
+        // consuming it; that should show as the dim/no-letter inactive icon, same as
+        // if it weren't running at all.
+        let active = Preferences.systemProxyEnabled || processManager.isTUNEnabled
         statusItem.button?.image = IconRenderer.makeIcon(mode: Preferences.outboundMode, active: active)
         updateStatusLine()
     }
