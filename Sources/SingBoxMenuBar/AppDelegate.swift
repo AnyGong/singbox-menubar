@@ -7,8 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Menu items kept as properties so we can update their checkmarks/titles in place.
     private var statusLineItem = NSMenuItem()
-    private var restartSingBoxItem = NSMenuItem()
-    private var stopSingBoxItem = NSMenuItem()
     private var controlPanelItem = NSMenuItem()
     private var outboundModeItem = NSMenuItem()
     private var systemProxyItem = NSMenuItem()
@@ -377,36 +375,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildMenu() {
         let menu = NSMenu()
 
-        // Status line: reflects current sing-box state ("Running · Normal mode" /
-        // "Running · TUN mode" / "Stopped"). No action/target of its own — clicking
-        // it just reveals the submenu below, same as any other AppKit menu item with
-        // a submenu. Kept in sync by `updateStatusLine`, called from `refreshIcon`.
-        let advancedActionsSubmenu = NSMenu()
-
-        restartSingBoxItem.title = "Restart sing-box"
-        restartSingBoxItem.action = #selector(restartSingBox)
-        restartSingBoxItem.target = self
-        advancedActionsSubmenu.addItem(restartSingBoxItem)
-
-        stopSingBoxItem.title = "Stop sing-box"
-        stopSingBoxItem.action = #selector(stopSingBoxManually)
-        stopSingBoxItem.target = self
-        advancedActionsSubmenu.addItem(stopSingBoxItem)
-
-        advancedActionsSubmenu.addItem(.separator())
-
-        advancedActionsSubmenu.addItem(withTitle: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
-        .target = self
-
-        statusLineItem.submenu = advancedActionsSubmenu
-        menu.addItem(statusLineItem)
-
-        menu.addItem(.separator())
-
         // Only one entry point to the dashboard — previously duplicated by "Show
         // Main Window" (an unwired stub opening no window) and this item. Disabled
         // when sing-box isn't running, since 127.0.0.1:9090 won't be reachable —
-        // kept in sync alongside restart/stop in `updateStatusLine`.
+        // kept in sync alongside the status control in `updateStatusLine`.
         controlPanelItem.title = "Open Control Panel"
         controlPanelItem.action = #selector(openControlPanel)
         controlPanelItem.target = self
@@ -484,6 +456,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        menu.addItem(withTitle: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
+        .target = self
+
         launchAtLoginItem.title = "Launch at Login"
         launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
         launchAtLoginItem.target = self
@@ -491,6 +466,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(launchAtLoginItem)
 
         menu.addItem(.separator())
+
+        // Status/control, directly clickable to start or stop sing-box — no
+        // submenu, no separate Restart/Stop items to dig into. The leading dot
+        // (green = running, gray = stopped) is the at-a-glance state; the title is
+        // the detail. Placed here, just above Quit, per the "clear, bottom-of-menu"
+        // request rather than buried above the mode/profile controls where it used
+        // to sit with a submenu.
+        statusLineItem.action = #selector(toggleSingBoxRunning)
+        statusLineItem.target = self
+        menu.addItem(statusLineItem)
 
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         .target = self
@@ -568,35 +553,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusLine()
     }
 
-    /// Keeps the status line's title, and the enabled state of its Restart/Stop
-    /// actions, in sync with reality. Deliberately folded into `refreshIcon` rather
-    /// than given its own scattered call sites — `refreshIcon` already runs from
-    /// every internal action AND from the periodic/on-menu-open external-state sync
-    /// (see `syncExternalState`), so piggybacking on it is what makes the status
-    /// line track external changes (sing-box started/stopped/reconfigured outside
-    /// this app) in real time too, without duplicating those triggers here.
+    /// Keeps the status/control item's dot + title, and "Open Control Panel"'s
+    /// enabled state, in sync with reality. Deliberately folded into `refreshIcon`
+    /// rather than given its own scattered call sites — `refreshIcon` already runs
+    /// from every internal action AND from the periodic/on-menu-open external-state
+    /// sync (see `syncExternalState`), so piggybacking on it is what makes the
+    /// status line track external changes (sing-box started/stopped/reconfigured
+    /// outside this app) in real time too, without duplicating those triggers here.
     ///
     /// `busyStatusMessage`, when set, takes priority over the normal
     /// running/stopped text — see `setBusyStatus`.
     private func updateStatusLine() {
+        let text: String
         if let busyStatusMessage {
-            statusLineItem.title = "sing-box: \(busyStatusMessage)"
+            text = "sing-box: \(busyStatusMessage)"
         } else if processManager.isRunning {
             let mode = processManager.isTUNEnabled ? "TUN mode" : "Normal mode"
-            statusLineItem.title = "sing-box: Running · \(mode)"
+            text = "sing-box: Running · \(mode)"
         } else {
-            statusLineItem.title = "sing-box: Stopped"
+            text = "sing-box: Stopped"
         }
+        let dotColor: NSColor = processManager.isRunning ? .systemGreen : .systemGray
+        statusLineItem.attributedTitle = statusLineTitle(dotColor: dotColor, text: text)
+
         let busy = busyStatusMessage != nil
-        restartSingBoxItem.isEnabled = processManager.isRunning && !busy
-        stopSingBoxItem.isEnabled = processManager.isRunning && !busy
+        // Clicking mid-transition (e.g. while "Switching to TUN mode…" is showing)
+        // would race the operation already in flight — disable the control itself
+        // for that window, same as the old Restart/Stop items were.
+        statusLineItem.isEnabled = !busy
         controlPanelItem.isEnabled = processManager.isRunning && !busy
     }
 
+    /// Builds the status item's title as "● sing-box: …" with only the dot colored
+    /// — the text keeps the menu's normal (unset) color/font so it still adapts
+    /// correctly to dark mode, selection highlight, and Dynamic Type, none of which
+    /// a plain colored-emoji-in-a-string approach would get right (emoji glyphs
+    /// ignore `.foregroundColor`, and can't be gray vs. green on demand).
+    private func statusLineTitle(dotColor: NSColor, text: String) -> NSAttributedString {
+        let title = NSMutableAttributedString(
+            string: "● ",
+            attributes: [.foregroundColor: dotColor, .font: NSFont.menuFont(ofSize: 0)]
+        )
+        title.append(NSAttributedString(string: text, attributes: [.font: NSFont.menuFont(ofSize: 0)]))
+        return title
+    }
+
     /// Shows a transient status-line message (e.g. "Switching to TUN mode…") and
-    /// disables Restart/Stop for the duration, so a several-second async operation
-    /// reads as "working on it" instead of the menu just not responding — see
-    /// `busyStatusMessage`'s doc comment for why this is needed.
+    /// disables the status control for the duration, so a several-second async
+    /// operation reads as "working on it" instead of the menu just not responding —
+    /// see `busyStatusMessage`'s doc comment for why this is needed.
     private func setBusyStatus(_ message: String) {
         busyStatusMessage = message
         updateStatusLine()
@@ -889,21 +894,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Manual control from the status line's Advanced Actions submenu. Currently
-    /// the same operation as "Reload Configuration" (restart with the active
-    /// profile, preserving normal-vs-TUN mode) — exposed again here, disabled
-    /// unless sing-box is actually running, alongside Stop for discoverability.
-    @objc private func restartSingBox() {
-        reloadConfiguration()
-    }
-
-    /// Manual control from the status line's Advanced Actions submenu.
-    /// `processManager.stop()` already disables System Proxy
-    /// (`disableSystemProxyIfDangling`, via `onStateChange`) and clears TUN state
-    /// as part of a genuine stop — this is just the explicit, user-facing entry
-    /// point for that same path, which also drives the icon/status line update.
-    @objc private func stopSingBoxManually() {
-        processManager.stop()
+    /// The status/control item's single action: start sing-box if it's stopped,
+    /// stop it if it's running. Replaces the old separate "Restart sing-box"/"Stop
+    /// sing-box" submenu items — a start defaults to normal mode (no TUN), matching
+    /// what "Set as System Proxy"'s auto-start already does, since a bare "start"
+    /// click shouldn't silently opt the user into Enhanced Mode; use the Enhanced
+    /// Mode (TUN) item for that. `processManager.stop()` already handles disabling
+    /// System Proxy if it'd otherwise be left dangling (`disableSystemProxyIfDangling`,
+    /// via `onStateChange`), same as it always has.
+    @objc private func toggleSingBoxRunning() {
+        if processManager.isRunning {
+            processManager.stop()
+        } else {
+            guard let path = Preferences.activeProfilePath else {
+                showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first.")
+                return
+            }
+            startSingBox(configPath: path, enableTUN: false, busyMessage: "Starting sing-box…") { [weak self] result in
+                if case .failure(let error) = result {
+                    self?.showNonBlockingAlert(title: "Failed to Start sing-box", message: error.localizedDescription)
+                }
+            }
+        }
     }
 
     @objc private func toggleAutoReloadOnConfigChange() {
