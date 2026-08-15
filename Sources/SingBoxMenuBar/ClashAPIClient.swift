@@ -42,6 +42,40 @@ final class ClashAPIClient {
         }.resume()
     }
 
+    /// Reads sing-box's *actual* current mode back via `GET /configs`. Used to detect
+    /// changes made externally — through another Clash client, a web dashboard, or a
+    /// direct API call — so the menu bar can reconcile itself instead of only ever
+    /// reflecting changes it made itself. Counterpart to `setMode`.
+    func getMode(completion: @escaping (Result<OutboundMode, Error>) -> Void) {
+        var request = URLRequest(url: baseURL.appendingPathComponent("configs"))
+        request.httpMethod = "GET"
+        if let secret {
+            request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                DispatchQueue.main.async { completion(.failure(ClashAPIError.badStatus(status))) }
+                return
+            }
+            guard
+                let data,
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let rawMode = json["mode"] as? String,
+                let mode = OutboundMode(clashModeValue: rawMode)
+            else {
+                DispatchQueue.main.async { completion(.failure(ClashAPIError.malformedResponse)) }
+                return
+            }
+            DispatchQueue.main.async { completion(.success(mode)) }
+        }.resume()
+    }
+
     /// Quick reachability check, e.g. before assuming live-switch will work.
     func ping(completion: @escaping (Bool) -> Void) {
         var request = URLRequest(url: baseURL.appendingPathComponent("version"))
@@ -57,10 +91,12 @@ final class ClashAPIClient {
 
 enum ClashAPIError: LocalizedError {
     case badStatus(Int)
+    case malformedResponse
 
     var errorDescription: String? {
         switch self {
         case .badStatus(let code): return "Clash API returned unexpected status \(code)"
+        case .malformedResponse: return "Clash API returned a response that could not be parsed"
         }
     }
 }

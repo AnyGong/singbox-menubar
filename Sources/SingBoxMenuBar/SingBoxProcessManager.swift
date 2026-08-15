@@ -124,6 +124,43 @@ final class SingBoxProcessManager {
         }
     }
 
+    /// Best-effort check for whether *a* sing-box process is alive on this machine,
+    /// regardless of whether this app is the one that launched it. Synchronous and
+    /// cheap enough to run on a timer; callers should still hop off the main thread
+    /// if calling frequently.
+    func isSingBoxProcessAlive() -> Bool {
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        check.arguments = ["-x", "sing-box"]
+        check.standardOutput = Pipe() // discard; we only care about the exit status
+        do {
+            try check.run()
+            check.waitUntilExit()
+        } catch {
+            AppLog.error("Failed to check sing-box process state: \(error.localizedDescription)")
+            return isRunning // fall back to what we already believe
+        }
+        return check.terminationStatus == 0
+    }
+
+    /// Reconciles `isRunning` with the actual OS-level process state and fires
+    /// `onStateChange` if it changed. Call this periodically (see AppDelegate's
+    /// state-sync timer) to catch sing-box being started, stopped, or killed outside
+    /// of this app — e.g. from Terminal, another launcher, or a crash we didn't own.
+    func reconcileRunningState() {
+        // If we hold a live process handle, our termination handler is already the
+        // source of truth — skip the pgrep-based reconciliation to avoid any chance
+        // of a name-matching false negative/positive fighting with it.
+        guard process == nil else { return }
+
+        let actuallyRunning = isSingBoxProcessAlive()
+        guard actuallyRunning != isRunning else { return }
+
+        AppLog.log("Detected sing-box \(actuallyRunning ? "started" : "stopped") externally; syncing state")
+        isRunning = actuallyRunning
+        onStateChange?(actuallyRunning)
+    }
+
     /// Terminates the running process, if any. Safe to call when nothing is running.
     /// Note: `process` here is the `sudo` wrapper, not sing-box itself — sudo forwards
     /// SIGTERM to its child by default, so this still shuts sing-box down cleanly. If

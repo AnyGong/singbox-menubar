@@ -1,6 +1,6 @@
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem!
     private let processManager = SingBoxProcessManager.shared
@@ -14,6 +14,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var currentSystemProxyService: String?
 
+    /// Periodically reconciles the menu bar with sing-box's *actual* state, so
+    /// changes made externally (via the Clash API, another client, `networksetup`,
+    /// or the sing-box process being started/stopped outside this app) are picked
+    /// up even if this app's own controls were never touched. See `syncExternalState`.
+    private var stateSyncTimer: Timer?
+    private static let stateSyncInterval: TimeInterval = 3
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.log("App launched")
 
@@ -22,8 +29,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshIcon()
 
         processManager.onStateChange = { [weak self] running in
-            self?.tunItem.state = running ? .on : .off
-            self?.refreshIcon()
+            guard let self else { return }
+            self.tunItem.state = running ? .on : .off
+            if !running {
+                self.disableSystemProxyIfDangling()
+            }
+            self.refreshIcon()
         }
 
         // Restore last profile automatically is intentionally NOT done here — starting
@@ -32,14 +43,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Preferences.activeProfilePath == nil {
             Preferences.activeProfilePath = ConfigManager.defaultProfile()?.path
         }
+
+        // Catch up with reality immediately (e.g. sing-box was already running before
+        // this app launched), then keep polling so later external changes are caught too.
+        syncExternalState()
+        stateSyncTimer = Timer.scheduledTimer(withTimeInterval: Self.stateSyncInterval, repeats: true) { [weak self] _ in
+            self?.syncExternalState()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         AppLog.log("App terminating — cleaning up")
+        stateSyncTimer?.invalidate()
+        stateSyncTimer = nil
         if let service = currentSystemProxyService, Preferences.systemProxyEnabled {
             SystemProxyManager.disable(service: service) { _ in }
         }
         processManager.stop()
+    }
+
+    // MARK: - External state sync
+
+    /// Also triggered on demand right before the menu opens (see `menuWillOpen`), so
+    /// the menu never shows stale checkmarks even in between poll ticks.
+    func menuWillOpen(_ menu: NSMenu) {
+        syncExternalState()
+    }
+
+    /// Pulls the real, current state of sing-box/macOS and reconciles the menu bar's
+    /// icon, letters, and checkmarks with it. Covers everything the menu bar can show
+    /// that could also be changed from outside this app:
+    ///   - process running / Enhanced Mode (TUN)   — via `pgrep`
+    ///   - outbound mode (Direct/Global/Rule)       — via Clash API `GET /configs`
+    ///   - system proxy on/off                      — via `networksetup` readback
+    private func syncExternalState() {
+        processManager.reconcileRunningState()
+
+        if processManager.isRunning {
+            syncOutboundModeFromKernel()
+            syncSystemProxyStateFromSystem()
+        } else {
+            // sing-box isn't running, so System Proxy can't be doing anything useful
+            // regardless of what macOS's proxy setting currently says — force it off
+            // rather than risking `syncSystemProxyStateFromSystem` racing back to "on"
+            // based on a stale `networksetup` readback taken before disabling finishes.
+            disableSystemProxyIfDangling()
+        }
+    }
+
+    private func syncOutboundModeFromKernel() {
+        ClashAPIClient.shared.getMode { [weak self] result in
+            guard let self, case .success(let mode) = result, mode != Preferences.outboundMode else { return }
+            AppLog.log("Detected outbound mode changed externally to \(mode.rawValue); syncing menu bar")
+            Preferences.outboundMode = mode
+            self.outboundModeItem.title = "Outbound Mode  (\(mode.badgeLetter))"
+            self.outboundModeItem.submenu?.items.forEach {
+                $0.state = ($0.representedObject as? OutboundMode) == mode ? .on : .off
+            }
+            self.refreshIcon()
+        }
+    }
+
+    private func syncSystemProxyStateFromSystem() {
+        guard let service = currentSystemProxyService ?? Preferences.preferredNetworkService else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let actuallyEnabled = SystemProxyManager.isEnabled(service: service)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, actuallyEnabled != Preferences.systemProxyEnabled else { return }
+                AppLog.log("Detected system proxy \(actuallyEnabled ? "enabled" : "disabled") externally for '\(service)'; syncing menu bar")
+                Preferences.systemProxyEnabled = actuallyEnabled
+                self.currentSystemProxyService = actuallyEnabled ? service : nil
+                self.systemProxyItem.state = actuallyEnabled ? .on : .off
+                self.refreshIcon()
+            }
+        }
+    }
+
+    /// System Proxy only does anything useful while sing-box is actually running and
+    /// listening on the proxy port — see `toggleSystemProxy`, which now refuses to
+    /// enable it otherwise. This is the other half of that invariant: if sing-box
+    /// stops (deliberately via Enhanced Mode, a crash, or externally) while System
+    /// Proxy is still marked on, turn it back off rather than leaving traffic pointed
+    /// at a dead port while the menu bar keeps showing a checkmark.
+    private func disableSystemProxyIfDangling() {
+        guard Preferences.systemProxyEnabled,
+              let service = currentSystemProxyService ?? Preferences.preferredNetworkService else { return }
+
+        AppLog.log("sing-box is not running while System Proxy is enabled for '\(service)'; disabling System Proxy")
+        SystemProxyManager.disable(service: service) { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result {
+                AppLog.error("Failed to cleanly disable dangling System Proxy: \(error.localizedDescription)")
+                // Fall through and mark it off in our own state regardless — we know
+                // it's non-functional either way (sing-box isn't there to serve it),
+                // so an inaccurate "off" the user can re-enable is safer than an
+                // inaccurate "on" that silently drops their traffic.
+            }
+            Preferences.systemProxyEnabled = false
+            self.currentSystemProxyService = nil
+            self.systemProxyItem.state = .off
+            self.refreshIcon()
+        }
     }
 
     // MARK: - Menu construction
@@ -48,10 +152,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         menu.addItem(withTitle: "Show Main Window", action: #selector(showMainWindow), keyEquivalent: "")
-            .target = self
+        .target = self
 
         menu.addItem(withTitle: "Open Control Panel in Default Browser", action: #selector(openControlPanel), keyEquivalent: "")
-            .target = self
+        .target = self
 
         menu.addItem(.separator())
 
@@ -90,7 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(switchProfileItem)
 
         menu.addItem(withTitle: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "")
-            .target = self
+        .target = self
 
         menu.addItem(.separator())
 
@@ -103,13 +207,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
-            .target = self
+        .target = self
 
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
-            .target = self
+        .target = self
 
+        menu.delegate = self
         statusItem.menu = menu
     }
 
@@ -160,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ClashAPIClient.shared.setMode(mode) { result in
                 if case .failure(let error) = result {
                     self.showNonBlockingAlert(title: "Mode Switch Failed",
-                                               message: "Preference was saved, but the running kernel could not be switched live: \(error.localizedDescription)")
+                        message: "Preference was saved, but the running kernel could not be switched live: \(error.localizedDescription)")
                 }
             }
         }
@@ -187,6 +292,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         } else {
+            // System Proxy routes traffic to sing-box's local HTTP inbound — with no
+            // sing-box running, nothing is listening on that port and the "success"
+            // this used to report was misleading. Require Enhanced Mode (TUN) first.
+            guard processManager.isRunning else {
+                showNonBlockingAlert(
+                    title: "sing-box Isn't Running",
+                    message: "System Proxy routes traffic to 127.0.0.1:\(SystemProxyManager.proxyPort), which only works while sing-box is running. Turn on Enhanced Mode (TUN) first, then try again."
+                )
+                return
+            }
+
             let services = SystemProxyManager.activeNetworkServices()
 
             if services.isEmpty {

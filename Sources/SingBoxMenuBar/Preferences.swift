@@ -18,6 +18,15 @@ enum OutboundMode: String, CaseIterable {
     var clashModeValue: String {
         rawValue.lowercased()
     }
+
+    /// Reverse of `clashModeValue` — used when reading the live mode back from
+    /// `GET /configs` so externally-made changes can be reflected in the menu bar.
+    init?(clashModeValue: String) {
+        guard let match = OutboundMode.allCases.first(where: { $0.clashModeValue == clashModeValue.lowercased() }) else {
+            return nil
+        }
+        self = match
+    }
 }
 
 enum Preferences {
