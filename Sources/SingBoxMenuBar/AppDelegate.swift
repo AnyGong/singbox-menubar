@@ -30,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         processManager.onStateChange = { [weak self] running in
             guard let self else { return }
-            self.tunItem.state = running ? .on : .off
+            self.tunItem.state = self.processManager.isTUNEnabled ? .on : .off
             if !running {
                 self.disableSystemProxyIfDangling()
             }
@@ -120,11 +120,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// System Proxy only does anything useful while sing-box is actually running and
-    /// listening on the proxy port — see `toggleSystemProxy`, which now refuses to
-    /// enable it otherwise. This is the other half of that invariant: if sing-box
-    /// stops (deliberately via Enhanced Mode, a crash, or externally) while System
-    /// Proxy is still marked on, turn it back off rather than leaving traffic pointed
-    /// at a dead port while the menu bar keeps showing a checkmark.
+    /// listening on the proxy port — see `toggleSystemProxy`, which auto-starts
+    /// sing-box (in normal, no-TUN mode) rather than requiring that separately. This
+    /// is the other half of that invariant: if sing-box stops (deliberately via
+    /// Enhanced Mode, a crash, or externally) while System Proxy is still marked on,
+    /// turn it back off rather than leaving traffic pointed at a dead port while the
+    /// menu bar keeps showing a checkmark.
     private func disableSystemProxyIfDangling() {
         guard Preferences.systemProxyEnabled,
               let service = currentSystemProxyService ?? Preferences.preferredNetworkService else { return }
@@ -183,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tunItem.title = "Enhanced Mode (TUN)"
         tunItem.action = #selector(toggleTUN)
         tunItem.target = self
-        tunItem.state = processManager.isRunning ? .on : .off
+        tunItem.state = processManager.isTUNEnabled ? .on : .off
         menu.addItem(tunItem)
 
         menu.addItem(.separator())
@@ -292,43 +293,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         } else {
-            // System Proxy routes traffic to sing-box's local HTTP inbound — with no
-            // sing-box running, nothing is listening on that port and the "success"
-            // this used to report was misleading. Require Enhanced Mode (TUN) first.
+            // System Proxy routes traffic to sing-box's local HTTP inbound, so it
+            // needs sing-box actually running. If it isn't, start it ourselves in
+            // normal mode — the active profile's config, with the TUN inbound left
+            // disabled — rather than erroring and making the user start it by hand
+            // first. Enhanced Mode (TUN) stays a separate, explicit opt-in.
             guard processManager.isRunning else {
-                showNonBlockingAlert(
-                    title: "sing-box Isn't Running",
-                    message: "System Proxy routes traffic to 127.0.0.1:\(SystemProxyManager.proxyPort), which only works while sing-box is running. Turn on Enhanced Mode (TUN) first, then try again."
-                )
+                guard let path = Preferences.activeProfilePath else {
+                    showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first, then try again.")
+                    return
+                }
+                processManager.start(configPath: path, enableTUN: false) { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case .success:
+                        self.beginEnablingSystemProxy()
+                    case .failure(let error):
+                        self.showNonBlockingAlert(title: "Failed to Start sing-box", message: error.localizedDescription)
+                    }
+                }
                 return
             }
 
-            let services = SystemProxyManager.activeNetworkServices()
+            beginEnablingSystemProxy()
+        }
+    }
 
-            if services.isEmpty {
-                showNonBlockingAlert(title: "No Active Network Service", message: "No active network services were found to set a proxy on.")
-                return
-            }
+    /// Picks (or reuses) a network service and turns System Proxy on for it. Split
+    /// out from `toggleSystemProxy` so it can run either immediately, when sing-box
+    /// is already running, or after auto-starting it in normal mode.
+    private func beginEnablingSystemProxy() {
+        let services = SystemProxyManager.activeNetworkServices()
 
-            // Reuse a previously chosen service without prompting again, as long as
-            // it's still active. Falls through to picker/auto-pick logic otherwise.
-            if let preferred = Preferences.preferredNetworkService, services.contains(preferred) {
-                enableSystemProxy(on: preferred)
-                return
-            }
+        if services.isEmpty {
+            showNonBlockingAlert(title: "No Active Network Service", message: "No active network services were found to set a proxy on.")
+            return
+        }
 
-            if services.count == 1 {
-                let only = services[0]
-                Preferences.preferredNetworkService = only
-                enableSystemProxy(on: only)
-                return
-            }
+        // Reuse a previously chosen service without prompting again, as long as
+        // it's still active. Falls through to picker/auto-pick logic otherwise.
+        if let preferred = Preferences.preferredNetworkService, services.contains(preferred) {
+            enableSystemProxy(on: preferred)
+            return
+        }
 
-            presentServicePicker(services: services) { [weak self] chosen in
-                guard let self, let chosen else { return }
-                Preferences.preferredNetworkService = chosen
-                self.enableSystemProxy(on: chosen)
-            }
+        if services.count == 1 {
+            let only = services[0]
+            Preferences.preferredNetworkService = only
+            enableSystemProxy(on: only)
+            return
+        }
+
+        presentServicePicker(services: services) { [weak self] chosen in
+            guard let self, let chosen else { return }
+            Preferences.preferredNetworkService = chosen
+            self.enableSystemProxy(on: chosen)
         }
     }
 
@@ -355,14 +374,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleTUN() {
-        if processManager.isRunning {
+        if processManager.isTUNEnabled {
+            // Fully stopping is the only way to drop the TUN interface — there's no
+            // "downgrade to normal mode in place" path. If System Proxy is also on,
+            // `disableSystemProxyIfDangling` (via `onStateChange`) will turn it off
+            // too rather than leaving it pointed at a now-dead port.
             processManager.stop()
         } else {
             guard let path = Preferences.activeProfilePath else {
                 showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first.")
                 return
             }
-            processManager.start(configPath: path) { [weak self] result in
+            // Note: sing-box may already be running here in normal mode (e.g.
+            // auto-started for System Proxy) — `start` restarts cleanly in that case.
+            processManager.start(configPath: path, enableTUN: true) { [weak self] result in
                 if case .failure(let error) = result {
                     self?.showNonBlockingAlert(title: "Failed to Start sing-box", message: error.localizedDescription)
                 }
@@ -373,12 +398,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectProfile(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         let wasRunning = processManager.isRunning
+        let wasTUNEnabled = processManager.isTUNEnabled
         Preferences.activeProfilePath = url.path
         rebuildProfileSubmenu()
         AppLog.log("Active profile switched to \(url.lastPathComponent)")
 
         if wasRunning {
-            processManager.start(configPath: url.path) { [weak self] result in
+            // Preserve whatever mode was already active (normal vs. TUN) rather than
+            // defaulting to TUN — a profile switch shouldn't silently turn Enhanced
+            // Mode on for someone who was only using System Proxy.
+            processManager.start(configPath: url.path, enableTUN: wasTUNEnabled) { [weak self] result in
                 if case .failure(let error) = result {
                     self?.showNonBlockingAlert(title: "Profile Switch Failed", message: error.localizedDescription)
                 }
@@ -388,7 +417,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func reloadConfiguration() {
         guard let path = Preferences.activeProfilePath else { return }
-        processManager.start(configPath: path) { [weak self] result in
+        // Same mode it was already running in — reload shouldn't change that.
+        processManager.start(configPath: path, enableTUN: processManager.isTUNEnabled) { [weak self] result in
             switch result {
             case .success:
                 AppLog.log("Configuration reloaded")

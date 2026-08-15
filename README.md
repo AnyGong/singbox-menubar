@@ -58,25 +58,46 @@ but Xcode is less fiddly for this step.
 1. **`sing-box` binary path** (`SingBoxProcessManager.singBoxBinaryPath`) — confirm
    `/opt/homebrew/bin/sing-box` is actually where `brew` put it:
    `which sing-box`.
+
 2. **Clash API port/secret** (`ClashAPIClient.baseURL`, `.secret`) — must match what's
-   in your actual sing-box config's `experimental.clash_api` block.
-3. **Outbound selector group name** (`ClashAPIClient.setMode`'s `selectorGroup`
-   parameter, default `"GLOBAL"`) — must match the selector-type outbound tag in your
-   config, or mode-switch-while-running will silently 4xx. If your config doesn't
-   define a Clash-API-compatible selector group, live-switching won't work and you'll
-   want to fall back to "always restart on mode change" — that's a one-line change in
-   `AppDelegate.selectMode`.
+   in your actual sing-box config's `experimental.clash_api` block. The default is
+   `http://127.0.0.1:9090` and no secret. If your config uses a different port or has
+   `secret`, update these accordingly.
+
+3. **Clash API mode switch** — The app switches Direct/Global/Rule by calling
+   `PATCH /configs` with a top-level `{"mode": "..."}` body. There is no selector
+   group involved. For this to work, your sing-box config must expose all three modes
+   in `mode-list`. A minimal `route` section to achieve this is:
+
+   ```json
+   "route": {
+     "rules": [
+       { "clash_mode": "Direct", "outbound": "direct" },
+       { "clash_mode": "Global", "outbound": "direct" }
+     ],
+     "final": "direct"
+   }
+   ```
+
+   If `mode-list` only contains `["Rule"]`, API calls to change mode will return
+   success but the mode will not change. Ensure the above rules are present before
+   testing live mode switching.
+
 4. **Local proxy host/port** (`SystemProxyManager.proxyHost/proxyPort`, default
    `127.0.0.1:7890`) — must match your config's HTTP inbound.
+
 5. **Profiles directory** (`Preferences.profilesDirectory`, default
    `~/.config/sing-box/`) — point this at wherever your `.yaml`/`.json` configs
    actually live.
+
 6. **Icon rendering** (`IconRenderer`) is a placeholder circle+badge, not a designed
    asset — swap in a real icon whenever you want it to look nicer; the R/G/D badge and
    two-color-state logic are the only things the spec actually requires.
+
 7. First "Enhanced Mode" or "Set as System Proxy" click will trigger a macOS admin
    password prompt (via AppleScript `do shell script ... with administrator
-   privileges`) — that's expected, per the "prompt per action" v1 approach.
+   privileges`) — that's expected, per the "prompt per action" v1 approach. See the
+   next section for a one-time setup that eliminates the prompts.
 
 ## One-time setup: passwordless sudo
 

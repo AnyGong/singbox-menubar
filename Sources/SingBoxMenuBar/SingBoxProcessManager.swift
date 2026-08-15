@@ -13,6 +13,11 @@ final class SingBoxProcessManager {
     private(set) var process: Process?
     private(set) var isRunning: Bool = false
 
+    /// Whether the *current* run has the TUN inbound active. Independent of
+    /// `isRunning` — sing-box can also run in "normal mode" (HTTP inbound only, no
+    /// TUN interface), e.g. when auto-started for System Proxy. See `start`.
+    private(set) var isTUNEnabled: Bool = false
+
     /// Called on the main thread whenever run state changes (started, stopped, crashed).
     var onStateChange: ((Bool) -> Void)?
 
@@ -60,7 +65,14 @@ final class SingBoxProcessManager {
 
     /// Validates then starts sing-box with the given config. Safe to call while a
     /// previous instance is running — it will be stopped first.
-    func start(configPath: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    ///
+    /// - Parameter enableTUN: When `true` (the default — matches the previous
+    ///   behavior of this method), the config is run as-authored. When `false`, any
+    ///   `tun`-type inbound is stripped from a generated copy of the config before
+    ///   running it, so sing-box comes up in "normal mode" (HTTP inbound only,
+    ///   never touching the TUN interface). Used by "Set as System Proxy" to
+    ///   auto-start sing-box without also opting the user into Enhanced Mode.
+    func start(configPath: String, enableTUN: Bool = true, completion: @escaping (Result<Void, Error>) -> Void) {
         let (ok, output) = validateConfig(at: configPath)
         guard ok else {
             completion(.failure(SingBoxError.invalidConfig(output)))
@@ -74,11 +86,24 @@ final class SingBoxProcessManager {
             return
         }
 
+        let runPath: String
+        if enableTUN {
+            runPath = configPath
+        } else {
+            switch Self.normalModeConfigPath(from: configPath) {
+            case .success(let path):
+                runPath = path
+            case .failure(let error):
+                completion(.failure(error))
+                return
+            }
+        }
+
         stop() // ensure clean slate before starting a new instance
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", singBoxBinaryPath, "run", "-c", configPath]
+        process.arguments = ["-n", singBoxBinaryPath, "run", "-c", runPath]
 
         // Redirect stdout+stderr straight to sing-box.log. Truncate on each start so
         // the file corresponds to the current run — sing-box's own log lines are
@@ -96,6 +121,7 @@ final class SingBoxProcessManager {
             DispatchQueue.main.async {
                 let wasRunning = self.isRunning
                 self.isRunning = false
+                self.isTUNEnabled = false
                 self.process = nil
                 try? logHandle.close()
 
@@ -114,13 +140,87 @@ final class SingBoxProcessManager {
             try process.run()
             self.process = process
             self.isRunning = true
-            AppLog.log("sing-box started (pid \(process.processIdentifier)) with config \(configPath)")
+            self.isTUNEnabled = enableTUN
+            AppLog.log("sing-box started (pid \(process.processIdentifier)) with config \(runPath)\(enableTUN ? "" : " [normal mode — TUN inbound disabled]")")
             DispatchQueue.main.async { self.onStateChange?(true) }
             completion(.success(()))
         } catch {
             try? logHandle.close()
             AppLog.error("Failed to start sing-box: \(error.localizedDescription)")
             completion(.failure(error))
+        }
+    }
+
+    // MARK: - Normal-mode (no-TUN) config generation
+
+    /// Directory for files this app generates itself, as opposed to user-authored
+    /// profiles (which live under `Preferences.profilesDirectory`).
+    private static let generatedConfigDirectory: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("singbox-menubar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private static let normalModeConfigURL = generatedConfigDirectory.appendingPathComponent("normal-mode.generated.json")
+
+    /// Produces a copy of `configPath` with any `tun`-type inbound removed, so
+    /// System Proxy's auto-start doesn't also stand up a TUN interface the user
+    /// didn't explicitly ask for via Enhanced Mode. Requires the source config to be
+    /// JSON — sing-box's native config format (see `ConfigManager`'s allowance of
+    /// `.yaml`/`.yml` profiles, which this can't currently strip).
+    private static func normalModeConfigPath(from configPath: String) -> Result<String, Error> {
+        guard let data = FileManager.default.contents(atPath: configPath) else {
+            return .failure(SingBoxError.normalModeConfigGenerationFailed("Could not read \((configPath as NSString).lastPathComponent)."))
+        }
+        guard let originalJSON = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return .failure(SingBoxError.normalModeConfigGenerationFailed(
+                "\((configPath as NSString).lastPathComponent) isn't valid JSON, so its TUN inbound (if any) couldn't be stripped for normal mode. sing-box configs must be JSON for System Proxy's auto-start to work."
+            ))
+        }
+
+        // Start from a full copy of the original config, not a hand-picked subset of
+        // keys — normal mode only ever changes `inbounds`. Everything else (dns,
+        // route, outbounds, and crucially `experimental.clash_api`, which is how
+        // this app talks to a running sing-box for outbound-mode switching — see
+        // ClashAPIClient) must survive untouched, or the app loses control of the
+        // very process it just started.
+        var normalModeJSON = originalJSON
+        if let inbounds = originalJSON["inbounds"] as? [[String: Any]] {
+            normalModeJSON["inbounds"] = inbounds.filter { ($0["type"] as? String)?.lowercased() != "tun" }
+        }
+
+        guard let stripped = try? JSONSerialization.data(withJSONObject: normalModeJSON, options: [.prettyPrinted]) else {
+            return .failure(SingBoxError.normalModeConfigGenerationFailed("Failed to serialize the generated normal-mode config."))
+        }
+
+        // Sanity-check the round trip before handing this off to sing-box. If the
+        // source profile declares experimental.clash_api but it didn't make it into
+        // the generated file, outbound-mode switching fails later with a confusing
+        // "Could not connect to the server" instead of a clear reason — catch that
+        // here, at generation time, instead.
+        let hadClashAPI = (originalJSON["experimental"] as? [String: Any])?["clash_api"] != nil
+        if hadClashAPI {
+            guard
+            let reparsed = try? JSONSerialization.jsonObject(with: stripped) as? [String: Any],
+            (reparsed["experimental"] as? [String: Any])?["clash_api"] != nil
+            else {
+                return .failure(SingBoxError.normalModeConfigGenerationFailed(
+                    "experimental.clash_api didn't survive generating the normal-mode config, so outbound mode switching would silently fail. This looks like a bug in the menu bar app — check the generated file at \(normalModeConfigURL.path)."
+                ))
+            }
+        } else {
+            AppLog.log(
+                "Source profile \((configPath as NSString).lastPathComponent) has no experimental.clash_api — outbound mode switching from the menu bar won't work while running from it.",
+                level: "WARN"
+            )
+        }
+
+        do {
+            try stripped.write(to: normalModeConfigURL, options: .atomic)
+            return .success(normalModeConfigURL.path)
+        } catch {
+            return .failure(SingBoxError.normalModeConfigGenerationFailed("Could not write generated config: \(error.localizedDescription)"))
         }
     }
 
@@ -174,6 +274,7 @@ final class SingBoxProcessManager {
         process.waitUntilExit()
         self.process = nil
         self.isRunning = false
+        self.isTUNEnabled = false
         onStateChange?(false)
     }
 }
@@ -182,6 +283,7 @@ enum SingBoxError: LocalizedError {
     case invalidConfig(String)
     case logFileUnavailable
     case privilegeNotConfigured(String)
+    case normalModeConfigGenerationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -191,6 +293,8 @@ enum SingBoxError: LocalizedError {
             return "Could not open sing-box.log for writing."
         case .privilegeNotConfigured(let message):
             return message
+        case .normalModeConfigGenerationFailed(let message):
+            return "Couldn't prepare a normal-mode (no-TUN) configuration:\n\(message)"
         }
     }
 }
