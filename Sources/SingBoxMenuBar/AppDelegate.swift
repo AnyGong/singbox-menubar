@@ -298,9 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 $0.state = ($0.representedObject as? OutboundMode) == mode ? .on : .off
             }
             AppNotifier.post(
+                category: .outboundMode,
                 title: "Outbound Mode Changed",
-                body: "Now using \(mode.rawValue) mode.",
-                identifier: "outbound-mode"
+                body: "Now using \(mode.rawValue) mode."
             )
             self.refreshIcon()
         }
@@ -317,9 +317,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.currentSystemProxyService = actuallyEnabled ? service : nil
                 self.systemProxyItem.state = actuallyEnabled ? .on : .off
                 AppNotifier.post(
+                    category: .systemProxy,
                     title: actuallyEnabled ? "System Proxy Enabled" : "System Proxy Disabled",
-                    body: actuallyEnabled ? "Enabled externally for '\(service)'." : "Disabled externally for '\(service)'.",
-                    identifier: "system-proxy"
+                    body: actuallyEnabled ? "Enabled externally for '\(service)'." : "Disabled externally for '\(service)'."
                 )
                 self.refreshIcon()
             }
@@ -381,9 +381,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.currentSystemProxyService = nil
             self.systemProxyItem.state = .off
             AppNotifier.post(
+                category: .systemProxy,
                 title: "System Proxy Disabled",
-                body: alertMessage ?? "System Proxy has been turned off for '\(service)'.",
-                identifier: "system-proxy"
+                body: alertMessage ?? "System Proxy has been turned off for '\(service)'."
             )
             self.refreshIcon()
             if let alertMessage {
@@ -687,9 +687,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AppLog.log("Outbound mode preference set to \(mode.rawValue)")
         if changed {
             AppNotifier.post(
+                category: .outboundMode,
                 title: "Outbound Mode Changed",
-                body: "Now using \(mode.rawValue) mode.",
-                identifier: "outbound-mode"
+                body: "Now using \(mode.rawValue) mode."
             )
         }
 
@@ -708,7 +708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let service = currentSystemProxyService else {
                 Preferences.systemProxyEnabled = false
                 systemProxyItem.state = .off
-                AppNotifier.post(title: "System Proxy Disabled", body: "System Proxy has been turned off.", identifier: "system-proxy")
+                AppNotifier.post(category: .systemProxy, title: "System Proxy Disabled", body: "System Proxy has been turned off.")
                 refreshIcon()
                 return
             }
@@ -719,7 +719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     Preferences.systemProxyEnabled = false
                     self.systemProxyItem.state = .off
                     self.currentSystemProxyService = nil
-                    AppNotifier.post(title: "System Proxy Disabled", body: "Disabled for '\(service)'.", identifier: "system-proxy")
+                    AppNotifier.post(category: .systemProxy, title: "System Proxy Disabled", body: "Disabled for '\(service)'.")
                     self.refreshIcon()
                 case .failure(let error):
                     self.handleSystemProxyError(error)
@@ -807,9 +807,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.currentSystemProxyService = service
                 self.systemProxyItem.state = .on
                 AppNotifier.post(
+                    category: .systemProxy,
                     title: "System Proxy Enabled",
-                    body: "Enabled for '\(service)'.",
-                    identifier: "system-proxy"
+                    body: "Enabled for '\(service)'."
                 )
                 self.refreshIcon()
             case .failure(let error):
