@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tunItem = NSMenuItem()
     private var switchProfileItem = NSMenuItem()
     private var launchAtLoginItem = NSMenuItem()
+    private var launchAtLoginToggleView: SwitchMenuItemView!
     private var autoReloadItem = NSMenuItem()
     private var remoteConfigItem = NSMenuItem()
 
@@ -460,9 +461,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         .target = self
 
         launchAtLoginItem.title = "Launch at Login"
-        launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
-        launchAtLoginItem.target = self
-        launchAtLoginItem.state = LaunchAtLogin.isEnabled ? .on : .off
+        // View-based rather than the plain checkmark every other toggle in this
+        // menu uses — see SwitchMenuItemView's doc comment for why. `title` above
+        // is still set even though the custom view is what actually renders (and
+        // does its own layout for) the row — AppKit falls back to it for
+        // accessibility (VoiceOver) and for the arrow-key-navigation label.
+        let toggleView = SwitchMenuItemView(title: "Launch at Login", isOn: LaunchAtLogin.isEnabled)
+        toggleView.onToggle = { [weak self] isOn in
+            self?.setLaunchAtLogin(isOn)
+        }
+        launchAtLoginItem.view = toggleView
+        launchAtLoginToggleView = toggleView
         menu.addItem(launchAtLoginItem)
 
         menu.addItem(.separator())
@@ -958,10 +967,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RemoteConfigUpdater.shared.checkNow()
     }
 
-    @objc private func toggleLaunchAtLogin() {
-        let newValue = !LaunchAtLogin.isEnabled
-        LaunchAtLogin.setEnabled(newValue)
-        launchAtLoginItem.state = LaunchAtLogin.isEnabled ? .on : .off
+    /// Applies a requested Launch at Login state, then reads back
+    /// `LaunchAtLogin.isEnabled` and syncs the switch to *that* rather than trusting
+    /// `isOn` blindly — `SMAppService.register()`/`unregister()` can fail silently
+    /// (permissions, a stale registration, etc. — see `LaunchAtLogin.setEnabled`'s
+    /// doc comment), and a switch showing "on" when it didn't actually take would
+    /// be worse than the old checkmark-based version, not better.
+    private func setLaunchAtLogin(_ isOn: Bool) {
+        LaunchAtLogin.setEnabled(isOn)
+        let actual = LaunchAtLogin.isEnabled
+        launchAtLoginToggleView.setOn(actual)
+        if actual != isOn {
+            AppLog.error("Launch at Login: requested \(isOn), but actual state is \(actual) after applying")
+        }
     }
 
     @objc private func revealLogs() {
