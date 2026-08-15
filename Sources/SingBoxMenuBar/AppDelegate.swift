@@ -126,6 +126,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let path = Preferences.activeProfilePath {
             configWatcher.watch(path: path)
+            // Warm the validation cache for the active profile at launch, in the
+            // background, so the *first* start/reload the user does — likely
+            // moments after opening the menu — can hit the cache instead of
+            // waiting on a real `sing-box check`. See requirements: "reuse cache
+            // at startup." Fire-and-forget: nothing here needs the result, only
+            // the side effect of `validateConfig` populating `ConfigValidationCache`.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.processManager.validateConfig(at: path)
+            }
         }
 
         RemoteConfigUpdater.shared.onResult = { [weak self] result in
@@ -186,6 +195,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard path == Preferences.activeProfilePath else { return }
         let name = (path as NSString).lastPathComponent
         AppLog.log("Detected external change to active configuration '\(name)'")
+
+        let willReloadNow = processManager.isRunning && Preferences.autoReloadOnConfigChange
+        if !willReloadNow {
+            // Nothing below is about to run a real `sing-box check` on its own —
+            // warm the validation cache now, in the background, so whenever the
+            // user does reload manually (or starts sing-box fresh on this file)
+            // it's instant instead of waiting on the check right then. See
+            // requirements: "run sing-box check when a configuration file is
+            // newly added or modified." If a reload *is* about to happen (the
+            // branch below), skip this — `start` will validate for real in a
+            // moment anyway, and racing a second concurrent check here would just
+            // be redundant work for the same result.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.processManager.validateConfig(at: path)
+            }
+        }
 
         guard processManager.isRunning else {
             // Nothing is currently serving this config, so there's nothing to

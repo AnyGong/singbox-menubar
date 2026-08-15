@@ -31,9 +31,19 @@ final class SingBoxProcessManager {
 
     // MARK: - Validation
 
-    /// Runs `sing-box check -c <config>` synchronously and returns (isValid, output).
-    /// Used before every start/reload/profile-switch per requirements §7.
+    /// Runs `sing-box check -c <config>` and returns (isValid, output) — reusing a
+    /// cached result from `ConfigValidationCache` when `path`'s content hasn't
+    /// changed since it was last actually checked, and storing a fresh result there
+    /// otherwise. Used before every start/reload/profile-switch per requirements
+    /// §7; the cache is what keeps that from re-running a multi-second check (e.g.
+    /// resolving remote rule-sets) every single time when nothing in the file
+    /// actually changed since the last one.
     func validateConfig(at path: String) -> (ok: Bool, output: String) {
+        if let cached = ConfigValidationCache.shared.cachedResult(for: path) {
+            AppLog.log("Reusing cached validation result for \((path as NSString).lastPathComponent) (unchanged since last check)")
+            return cached
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: singBoxBinaryPath)
         process.arguments = ["check", "-c", path]
@@ -48,7 +58,7 @@ final class SingBoxProcessManager {
         } catch {
             let msg = "Failed to launch sing-box for validation: \(error.localizedDescription)"
             AppLog.error(msg)
-            return (false, msg)
+            return (false, msg) // not cached — a launch failure is ours, not a property of the file
         }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -57,7 +67,9 @@ final class SingBoxProcessManager {
         if !ok {
             AppLog.error("Config validation failed for \(path): \(output)")
         }
-        return (ok, output)
+        let result = (ok, output)
+        ConfigValidationCache.shared.store(result: result, for: path)
+        return result
     }
 
     // MARK: - Start / Stop
