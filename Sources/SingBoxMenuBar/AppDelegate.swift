@@ -506,6 +506,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchAtLoginToggleView = toggleView
         menu.addItem(launchAtLoginItem)
 
+        // Destructive/rare — kept in its own separated slot rather than grouped
+        // with the routine toggles above. See `performCleanUp`.
+        menu.addItem(withTitle: "Clean Up…", action: #selector(promptCleanUp), keyEquivalent: "")
+        .target = self
+
         menu.addItem(.separator())
 
         // Status/control, directly clickable to start or stop sing-box — no
@@ -1075,6 +1080,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Clean Up
+
+    /// Confirms with the user, then hands off to `performCleanUp`. "Clean Up" is
+    /// second/non-default here — the destructive option deliberately isn't the one
+    /// bound to Return, so pressing Enter/Space out of habit lands on Cancel instead.
+    @objc private func promptCleanUp() {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Clean Up singbox-menubar?"
+        alert.informativeText = """
+                                This always:
+                                • Stops sing-box, if it's running
+                                • Turns off System Proxy
+                                • Turns off Launch at Login
+                                • Resets this app's saved settings (mode, active profile, toggles) to defaults
+
+                                This never touches the sing-box binary itself, the passwordless-sudo setup, or this app bundle.
+                                """
+
+        let checkbox = NSButton(checkboxWithTitle: "Also delete config profiles (~/.config/sing-box) and logs", target: nil, action: nil)
+        checkbox.state = .off
+        alert.accessoryView = checkbox
+
+        alert.addButton(withTitle: "Cancel")
+        let cleanButton = alert.addButton(withTitle: "Clean Up")
+        cleanButton.hasDestructiveAction = true
+
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        performCleanUp(alsoDeleteFilesAndProfiles: checkbox.state == .on)
+    }
+
+    /// Removes this app's footprint from the system — see requirements: "quickly
+    /// remove the app's changes to the system... restore a clean environment,"
+    /// aimed at development/testing.
+    ///
+    /// Always: stops sing-box, disables System Proxy for every active network
+    /// service that currently reports it on (not just whichever one this session
+    /// happens to be tracking in `currentSystemProxyService` — a stray enable left
+    /// over from an earlier crash/session on some other service should still get
+    /// caught here), turns off Launch at Login, and resets every preference this
+    /// app has written back to first-launch defaults.
+    ///
+    /// Only if `alsoDeleteFilesAndProfiles` is true (opt-in, off by default in the
+    /// confirmation dialog): also deletes this app's generated files, its logs,
+    /// AND the sing-box profiles directory (`~/.config/sing-box`) — the last of
+    /// which isn't exclusively this app's (the user may hand-author or use those
+    /// configs with sing-box directly), so it's never touched without explicit
+    /// confirmation.
+    ///
+    /// Deliberately does NOT: uninstall sing-box itself, remove the
+    /// passwordless-sudo entry (that's a root-owned file outside anything this app
+    /// can write — see README), or quit/delete the app bundle. This is a state
+    /// reset, not an uninstaller for sing-box or for itself.
+    private func performCleanUp(alsoDeleteFilesAndProfiles: Bool) {
+        AppLog.log("Clean Up: starting (also deleting files/profiles: \(alsoDeleteFilesAndProfiles))")
+
+        if processManager.isRunning {
+            processManager.stop() // cascades into disabling System Proxy via onStateChange, same as any other stop
+        }
+
+        // Belt-and-suspenders beyond the above: catch a stray enable on some other
+        // service this app session was never tracking.
+        for service in SystemProxyManager.activeNetworkServices() where SystemProxyManager.isEnabled(service: service) {
+            SystemProxyManager.disable(service: service) { _ in }
+        }
+        Preferences.systemProxyEnabled = false
+        currentSystemProxyService = nil
+        systemProxyItem.state = .off
+
+        if LaunchAtLogin.isEnabled {
+            setLaunchAtLogin(false)
+        }
+
+        configWatcher.stop()
+        RemoteConfigUpdater.shared.stop()
+
+        processManager.removeGeneratedFiles() // this app's own generated file, never user data — always safe
+
+        // Deletes the log directory itself if requested, so nothing after this
+        // point should rely on AppLog actually landing on disk — hence this being
+        // last among the AppLog-adjacent steps above.
+        if alsoDeleteFilesAndProfiles {
+            try? FileManager.default.removeItem(at: AppLog.directory)
+            try? FileManager.default.removeItem(at: Preferences.profilesDirectory)
+        }
+
+        Preferences.resetAll()
+
+        // Reflect the reset state immediately rather than waiting for the next
+        // menu open/external-state poll to catch up.
+        rebuildProfileSubmenu()
+        rebuildRemoteConfigSubmenu()
+        tunItem.state = .off
+        refreshIcon()
+
+        let summary = alsoDeleteFilesAndProfiles
+                ? "sing-box stopped, System Proxy and Launch at Login turned off, settings reset, and app files/logs/profiles removed."
+                : "sing-box stopped, System Proxy and Launch at Login turned off, and settings reset. Config profiles and logs were kept."
+        let completionAlert = NSAlert()
+        completionAlert.messageText = "Clean Up Complete"
+        completionAlert.informativeText = summary + " You can now quit the app (⌘Q) and, if you'd like, delete it entirely."
+        completionAlert.addButton(withTitle: "OK")
+        completionAlert.runModal()
     }
 
     // MARK: - Diagnostics

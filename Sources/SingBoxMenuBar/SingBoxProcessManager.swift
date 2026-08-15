@@ -371,6 +371,16 @@ final class SingBoxProcessManager {
         stopQuietly()
         onStateChange?(false)
     }
+
+    /// Deletes files this app generates itself (currently just the normal-mode/no-TUN
+    /// config — see `normalModeConfigPath`) — never user-authored profiles, which
+    /// live elsewhere (`Preferences.profilesDirectory`) and are out of scope here.
+    /// Used by "Clean Up" (see AppDelegate) to remove this app's footprint from disk.
+    /// Best-effort: a config that was never generated this run (nothing to remove)
+    /// isn't an error.
+    func removeGeneratedFiles() {
+        try? FileManager.default.removeItem(at: Self.generatedConfigDirectory)
+    }
 }
 
 enum SingBoxError: LocalizedError {

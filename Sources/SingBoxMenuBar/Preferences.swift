@@ -161,4 +161,28 @@ enum Preferences {
         }
         disabledNotificationCategories = disabled
     }
+
+    /// Removes every preference this app has ever written, restoring first-launch
+    /// defaults (Rule mode, no active profile, System Proxy/auto-reload/auto-restart
+    /// all off, etc.) without needing to keep this list in sync with every default
+    /// value individually. Used by "Clean Up" (see AppDelegate) — deliberately does
+    /// NOT touch anything outside `UserDefaults` (files, System Proxy, Launch at
+    /// Login, the running process); those are each cleaned up independently by the
+    /// caller, since only some of them should happen unconditionally.
+    static func resetAll() {
+        for key in [
+            Keys.outboundMode,
+            Keys.activeProfilePath,
+            Keys.systemProxyEnabled,
+            Keys.launchAtLogin,
+            Keys.preferredNetworkService,
+            Keys.autoReloadOnConfigChange,
+            Keys.autoRestartOnUnexpectedExit,
+            Keys.remoteConfigURL,
+            Keys.remoteConfigInterval,
+            Keys.disabledNotificationCategories
+        ] {
+            defaults.removeObject(forKey: key)
+        }
+    }
 }
