@@ -47,7 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         AppNotifier.requestAuthorizationIfNeeded()
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        // .variableLength, not .squareLength — the icon is no longer a fixed square
+        // now that it can show icon+letter side-by-side (see IconRenderer), so the
+        // button needs to size itself to whatever width the current image actually is.
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
         refreshIcon()
 
