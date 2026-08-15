@@ -8,4 +8,5 @@ app.setActivationPolicy(.accessory)
 
 let delegate = AppDelegate()
 app.delegate = delegate
+StatusMenuRedesign.shared.install()
 app.run()
