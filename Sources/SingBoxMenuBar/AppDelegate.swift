@@ -413,6 +413,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controlPanelItem.isEnabled = processManager.isRunning
         menu.addItem(controlPanelItem)
 
+        // Always enabled, regardless of run state — that's the point: this is what
+        // you reach for to find out *why* sing-box isn't running, not just when it
+        // already is.
+        menu.addItem(withTitle: "Diagnostics", action: #selector(runDiagnostics), keyEquivalent: "")
+        .target = self
+
         menu.addItem(.separator())
 
         // Outbound Mode submenu
@@ -946,6 +952,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Diagnostics
+
+    @objc private func runDiagnostics() {
+        AppLog.log("Running diagnostics")
+        DiagnosticsRunner.run(systemProxyService: currentSystemProxyService ?? Preferences.preferredNetworkService) { [weak self] result in
+            self?.presentDiagnostics(result)
+        }
+    }
+
+    /// Shows the diagnostics report as a single alert listing every check with a
+    /// status glyph and a short explanation — simple and non-blocking (see
+    /// `showNonBlockingAlert`'s doc comment on what "non-blocking" means here: it
+    /// doesn't hold up sing-box or the rest of the app, only further menu clicks
+    /// until dismissed), which is all a one-shot health check needs. Unlike
+    /// `showNonBlockingAlert`, this isn't necessarily reporting a problem, so it
+    /// doesn't log at error level or use the warning alert style.
+    private func presentDiagnostics(_ result: DiagnosticsResult) {
+        let alert = NSAlert()
+        alert.messageText = "Diagnostics"
+        alert.alertStyle = .informational
+        alert.informativeText = result.checks
+                .map { "\($0.status.symbol) \($0.title): \($0.detail)" }
+                .joined(separator: "\n\n")
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - Helpers

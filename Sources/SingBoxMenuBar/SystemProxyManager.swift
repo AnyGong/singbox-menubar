@@ -19,10 +19,10 @@ enum SystemProxyManager {
             return []
         }
         return output
-            .split(separator: "\n")
-            .map(String.init)
-            .dropFirst() // first line is an informational header
-            .filter { !$0.hasPrefix("*") }
+                .split(separator: "\n")
+                .map(String.init)
+                .dropFirst() // first line is an informational header
+                .filter { !$0.hasPrefix("*") }
     }
 
     /// Enables the system proxy for the given service.
@@ -53,6 +53,27 @@ enum SystemProxyManager {
             return false
         }
         return output.contains("Enabled: Yes")
+    }
+
+    /// Reads back the actual enabled/host/port `networksetup` reports for `service`
+    /// right now — used by Diagnostics to confirm the system proxy isn't just
+    /// marked "on" in our own preferences, but genuinely pointing at sing-box's
+    /// local proxy port at the OS level. `host`/`port` are `nil` if the command
+    /// failed or the expected lines weren't present in its output.
+    static func currentProxySettings(service: String) -> (enabled: Bool, host: String?, port: String?) {
+        guard let output = runUnprivileged(networksetupPath, ["-getwebproxy", service]) else {
+            return (false, nil, nil)
+        }
+        var host: String?
+        var port: String?
+        for line in output.split(separator: "\n") {
+            if line.hasPrefix("Server: ") {
+                host = line.dropFirst("Server: ".count).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("Port: ") {
+                port = line.dropFirst("Port: ".count).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return (output.contains("Enabled: Yes"), host, port)
     }
 
     // MARK: - Internals
