@@ -425,6 +425,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu construction
 
+    /// Consistent SF Symbol icon for a menu item. Template-rendered, so AppKit
+    /// recolors it correctly in both the normal state and the highlighted
+    /// (blue-background) hover/selected state automatically — exactly how the
+    /// system's own menu-bar extras (Control Center, Wi-Fi, Bluetooth, etc.) render
+    /// their own menu icons. `nil` is allowed and returns `nil`, so call sites for
+    /// homogeneous list entries (a profile name, a time interval, a notification
+    /// category — see below) can skip an icon entirely without a separate branch;
+    /// giving every item in a list of otherwise-identical choices its own icon adds
+    /// visual noise without adding real distinction, so those are left icon-less by
+    /// design — icons are reserved for items that are genuinely different *kinds*
+    /// of thing from their neighbors.
+    private static func menuIcon(_ symbolName: String?) -> NSImage? {
+        guard let symbolName else { return nil }
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+        .withSymbolConfiguration(config) else {
+            return nil
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    /// Menu layout, top to bottom, grouped by how often each thing gets touched
+    /// rather than by subsystem — see requirements: "Logical Reordering: Based on
+    /// usage frequency and functional attributes."
+    ///
+    ///   1. Dashboard + the three controls actually flipped day-to-day (mode,
+    ///      System Proxy, Enhanced Mode) — flat, no digging required.
+    ///   2. Configuration — profile/config file management, touched occasionally.
+    ///   3. Settings — automation toggles and preferences, touched rarely, so
+    ///      tucked away rather than competing with the controls above.
+    ///   4. Utilities — diagnostics/logs/cleanup, touched only when something's
+    ///      wrong or during setup — see requirements: "Function Integration:
+    ///      Streamline and merge similar operations, simplifying redundant menu
+    ///      items," which is what collapsing 3 previously-flat, rarely-used
+    ///      top-level items into one submenu is doing here.
+    ///   5. Status control + Quit, unchanged from its earlier placement.
+    ///
+    /// Every actionable item gets a semantically-matched SF Symbol (see
+    /// `menuIcon`) — template images, so they get the system's own highlight
+    /// recoloring for free; that (plus the native blue hover highlight every plain
+    /// NSMenuItem already gets from AppKit) is this redesign's answer to
+    /// "Improve the visual feedback for mouse hover and click states" for
+    /// everything except the one view-based row (Launch at Login), which didn't
+    /// have *any* hover feedback before — see `SwitchMenuItemView`, which now adds
+    /// its own. Submenu expand/collapse animation is entirely system-owned by
+    /// `NSMenu` with no public API to customize — the most this redesign can (and,
+    /// for "perfect integration with native macOS visuals," should) do there is
+    /// avoid unnecessary nesting depth so it's never more than two levels deep.
     private func buildMenu() {
         let menu = NSMenu()
 
@@ -433,26 +482,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // when sing-box isn't running, since 127.0.0.1:9090 won't be reachable —
         // kept in sync alongside the status control in `updateStatusLine`.
         controlPanelItem.title = "Open Control Panel"
+        controlPanelItem.image = Self.menuIcon("safari")
         controlPanelItem.action = #selector(openControlPanel)
         controlPanelItem.target = self
         controlPanelItem.isEnabled = processManager.isRunning
         menu.addItem(controlPanelItem)
 
-        // Always enabled, regardless of run state — that's the point: this is what
-        // you reach for to find out *why* sing-box isn't running, not just when it
-        // already is.
-        menu.addItem(withTitle: "Diagnostics", action: #selector(runDiagnostics), keyEquivalent: "")
-        .target = self
-
         menu.addItem(.separator())
 
-        // Outbound Mode submenu
+        // Outbound Mode submenu — the three routing behaviors are genuinely
+        // distinct concepts, so unlike most radio-style lists in this menu, each
+        // one earns its own icon rather than going icon-less.
         outboundModeItem.title = "Outbound Mode  (\(Preferences.outboundMode.badgeLetter))"
+        outboundModeItem.image = Self.menuIcon("arrow.triangle.branch")
         let modeSubmenu = NSMenu()
         for mode in OutboundMode.allCases {
             let item = NSMenuItem(title: mode.rawValue, action: #selector(selectMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
+            item.image = Self.menuIcon(mode.symbolName)
             item.state = (mode == Preferences.outboundMode) ? .on : .off
             modeSubmenu.addItem(item)
         }
@@ -461,6 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Set as System Proxy
         systemProxyItem.title = "Set as System Proxy"
+        systemProxyItem.image = Self.menuIcon("network")
         systemProxyItem.action = #selector(toggleSystemProxy)
         systemProxyItem.target = self
         systemProxyItem.state = Preferences.systemProxyEnabled ? .on : .off
@@ -468,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Enhanced Mode (TUN)
         tunItem.title = "Enhanced Mode (TUN)"
+        tunItem.image = Self.menuIcon("bolt.shield")
         tunItem.action = #selector(toggleTUN)
         tunItem.target = self
         tunItem.state = processManager.isTUNEnabled ? .on : .off
@@ -475,72 +525,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        // Switch Profile submenu
-        switchProfileItem.title = "Switch Profile"
-        rebuildProfileSubmenu()
-        menu.addItem(switchProfileItem)
+        let configurationItem = NSMenuItem(title: "Configuration", action: nil, keyEquivalent: "")
+        configurationItem.image = Self.menuIcon("doc.badge.gearshape")
+        configurationItem.submenu = buildConfigurationSubmenu()
+        menu.addItem(configurationItem)
 
-        // Work regardless of run state — opening the folder or an editor doesn't
-        // touch sing-box at all, so neither is gated on `processManager.isRunning`.
-        menu.addItem(withTitle: "Open Config Folder", action: #selector(openConfigFolder), keyEquivalent: "")
-        .target = self
+        let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        settingsItem.image = Self.menuIcon("gearshape")
+        settingsItem.submenu = buildSettingsSubmenu()
+        menu.addItem(settingsItem)
 
-        menu.addItem(withTitle: "Edit Current Config", action: #selector(editCurrentConfig), keyEquivalent: "")
-        .target = self
-
-        menu.addItem(withTitle: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "")
-        .target = self
-
-        // Governs how external changes to the active profile file are handled — see
-        // `handleExternalConfigChange`. Off by default: notify and wait for a
-        // manual reload rather than restarting a privileged process unprompted.
-        autoReloadItem.title = "Auto Reload on Config Change"
-        autoReloadItem.action = #selector(toggleAutoReloadOnConfigChange)
-        autoReloadItem.target = self
-        autoReloadItem.state = Preferences.autoReloadOnConfigChange ? .on : .off
-        menu.addItem(autoReloadItem)
-
-        // Off by default: only notify on an unexpected exit (crash, or external
-        // termination) and otherwise leave sing-box stopped for manual
-        // intervention — same as before this toggle existed. See
-        // `attemptAutoRestartIfEnabled`, invoked from the crash branch of
-        // `onStateChange` above.
-        autoRestartItem.title = "Auto-restart sing-box"
-        autoRestartItem.action = #selector(toggleAutoRestartOnUnexpectedExit)
-        autoRestartItem.target = self
-        autoRestartItem.state = Preferences.autoRestartOnUnexpectedExit ? .on : .off
-        menu.addItem(autoRestartItem)
-
-        // Remote Config submenu — a periodic downloader that writes over the
-        // active profile file (see RemoteConfigUpdater); what happens after a
-        // successful write is governed by the same Auto Reload setting above.
-        remoteConfigItem.title = "Remote Config"
-        rebuildRemoteConfigSubmenu()
-        menu.addItem(remoteConfigItem)
-
-        menu.addItem(.separator())
-
-        menu.addItem(withTitle: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
-        .target = self
-
-        launchAtLoginItem.title = "Launch at Login"
-        // View-based rather than the plain checkmark every other toggle in this
-        // menu uses — see SwitchMenuItemView's doc comment for why. `title` above
-        // is still set even though the custom view is what actually renders (and
-        // does its own layout for) the row — AppKit falls back to it for
-        // accessibility (VoiceOver) and for the arrow-key-navigation label.
-        let toggleView = SwitchMenuItemView(title: "Launch at Login", isOn: LaunchAtLogin.isEnabled)
-        toggleView.onToggle = { [weak self] isOn in
-            self?.setLaunchAtLogin(isOn)
-        }
-        launchAtLoginItem.view = toggleView
-        launchAtLoginToggleView = toggleView
-        menu.addItem(launchAtLoginItem)
-
-        // Destructive/rare — kept in its own separated slot rather than grouped
-        // with the routine toggles above. See `performCleanUp`.
-        menu.addItem(withTitle: "Clean Up…", action: #selector(promptCleanUp), keyEquivalent: "")
-        .target = self
+        let utilitiesItem = NSMenuItem(title: "Utilities", action: nil, keyEquivalent: "")
+        utilitiesItem.image = Self.menuIcon("wrench.and.screwdriver")
+        utilitiesItem.submenu = buildUtilitiesSubmenu()
+        menu.addItem(utilitiesItem)
 
         menu.addItem(.separator())
 
@@ -559,6 +557,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.delegate = self
         statusItem.menu = menu
+    }
+
+    /// Profile/config-file management — previously five flat top-level items
+    /// (Switch Profile, Open Config Folder, Edit Current Config, Reload
+    /// Configuration, Remote Config); consolidated here per "Function
+    /// Integration: Streamline and merge similar operations."
+    private func buildConfigurationSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+
+        switchProfileItem.title = "Switch Profile"
+        switchProfileItem.image = Self.menuIcon("doc.on.doc")
+        rebuildProfileSubmenu()
+        submenu.addItem(switchProfileItem)
+
+        // Work regardless of run state — opening the folder or an editor doesn't
+        // touch sing-box at all, so neither is gated on `processManager.isRunning`.
+        let openFolderItem = NSMenuItem(title: "Open Config Folder", action: #selector(openConfigFolder), keyEquivalent: "")
+        openFolderItem.target = self
+        openFolderItem.image = Self.menuIcon("folder")
+        submenu.addItem(openFolderItem)
+
+        let editItem = NSMenuItem(title: "Edit Current Config", action: #selector(editCurrentConfig), keyEquivalent: "")
+        editItem.target = self
+        editItem.image = Self.menuIcon("square.and.pencil")
+        submenu.addItem(editItem)
+
+        let reloadItem = NSMenuItem(title: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "")
+        reloadItem.target = self
+        reloadItem.image = Self.menuIcon("arrow.clockwise")
+        submenu.addItem(reloadItem)
+
+        submenu.addItem(.separator())
+
+        // Remote Config submenu — a periodic downloader that writes over the
+        // active profile file (see RemoteConfigUpdater); what happens after a
+        // successful write is governed by Auto Reload on Config Change, in Settings.
+        remoteConfigItem.title = "Remote Config"
+        remoteConfigItem.image = Self.menuIcon("icloud.and.arrow.down")
+        rebuildRemoteConfigSubmenu()
+        submenu.addItem(remoteConfigItem)
+
+        return submenu
+    }
+
+    /// Automation toggles and preferences — previously four flat top-level items
+    /// (Auto Reload, Auto-restart, Launch at Login) plus a "Notifications" submenu
+    /// that was documented (see `NotificationCategory`'s doc comment) but never
+    /// actually built anywhere — added here for real. All of these are
+    /// set-once-and-forget, so grouping them out of the way of the daily-driver
+    /// controls above is both the "Function Integration" and "Logical Reordering"
+    /// asks acting on the same items.
+    private func buildSettingsSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+
+        // Governs how external changes to the active profile file are handled —
+        // see `handleExternalConfigChange`. Off by default: notify and wait for a
+        // manual reload rather than restarting a privileged process unprompted.
+        autoReloadItem.title = "Auto Reload on Config Change"
+        autoReloadItem.image = Self.menuIcon("arrow.triangle.2.circlepath")
+        autoReloadItem.action = #selector(toggleAutoReloadOnConfigChange)
+        autoReloadItem.target = self
+        autoReloadItem.state = Preferences.autoReloadOnConfigChange ? .on : .off
+        submenu.addItem(autoReloadItem)
+
+        // Off by default: only notify on an unexpected exit (crash, or external
+        // termination) and otherwise leave sing-box stopped for manual
+        // intervention — same as before this toggle existed. See
+        // `attemptAutoRestartIfEnabled`, invoked from the crash branch of
+        // `onStateChange`.
+        autoRestartItem.title = "Auto-restart sing-box"
+        autoRestartItem.image = Self.menuIcon("arrow.counterclockwise.circle")
+        autoRestartItem.action = #selector(toggleAutoRestartOnUnexpectedExit)
+        autoRestartItem.target = self
+        autoRestartItem.state = Preferences.autoRestartOnUnexpectedExit ? .on : .off
+        submenu.addItem(autoRestartItem)
+
+        submenu.addItem(.separator())
+
+        let notificationsItem = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
+        notificationsItem.image = Self.menuIcon("bell")
+        notificationsItem.submenu = buildNotificationsSubmenu()
+        submenu.addItem(notificationsItem)
+
+        submenu.addItem(.separator())
+
+        launchAtLoginItem.title = "Launch at Login"
+        // View-based rather than the plain checkmark every other toggle in this
+        // menu uses — see SwitchMenuItemView's doc comment for why. `title` above
+        // is still set even though the custom view is what actually renders (and
+        // does its own layout for) the row — AppKit falls back to it for
+        // accessibility (VoiceOver) and for the arrow-key-navigation label.
+        let toggleView = SwitchMenuItemView(title: "Launch at Login", systemSymbolName: "power", isOn: LaunchAtLogin.isEnabled)
+        toggleView.onToggle = { [weak self] isOn in
+            self?.setLaunchAtLogin(isOn)
+        }
+        launchAtLoginItem.view = toggleView
+        launchAtLoginToggleView = toggleView
+        submenu.addItem(launchAtLoginItem)
+
+        return submenu
+    }
+
+    /// One toggle per `NotificationCategory`, letting a user mute just the
+    /// noisy-for-them category (e.g. rapid external config-change notifications)
+    /// rather than all-or-nothing. Homogeneous list of otherwise-identical
+    /// checkbox rows, so — same reasoning as profile/interval entries elsewhere —
+    /// left icon-less; the "Notifications" parent item's bell icon already
+    /// establishes what this whole list is about.
+    private func buildNotificationsSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        for category in NotificationCategory.allCases {
+            let item = NSMenuItem(title: category.displayName, action: #selector(toggleNotificationCategory(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = category
+            item.state = Preferences.isNotificationCategoryEnabled(category) ? .on : .off
+            submenu.addItem(item)
+        }
+        return submenu
+    }
+
+    /// Troubleshooting/maintenance tools — previously three flat top-level items
+    /// (Diagnostics, Reveal Logs in Finder, Clean Up…), each reached for only when
+    /// something's wrong or during first-time setup, not in routine day-to-day use.
+    private func buildUtilitiesSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+
+        // Always enabled, regardless of run state — this is what you reach for to
+        // find out *why* sing-box isn't running, not just when it already is.
+        let diagnosticsItem = NSMenuItem(title: "Diagnostics", action: #selector(runDiagnostics), keyEquivalent: "")
+        diagnosticsItem.target = self
+        diagnosticsItem.image = Self.menuIcon("stethoscope")
+        submenu.addItem(diagnosticsItem)
+
+        let revealLogsItem = NSMenuItem(title: "Reveal Logs in Finder", action: #selector(revealLogs), keyEquivalent: "")
+        revealLogsItem.target = self
+        revealLogsItem.image = Self.menuIcon("doc.text.magnifyingglass")
+        submenu.addItem(revealLogsItem)
+
+        submenu.addItem(.separator())
+
+        // Destructive/rare — kept below its own separator even within this
+        // already-rarely-opened submenu. See `performCleanUp`.
+        let cleanUpItem = NSMenuItem(title: "Clean Up…", action: #selector(promptCleanUp), keyEquivalent: "")
+        cleanUpItem.target = self
+        cleanUpItem.image = Self.menuIcon("trash")
+        submenu.addItem(cleanUpItem)
+
+        return submenu
     }
 
     private func rebuildProfileSubmenu() {
@@ -597,6 +743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let setURLItem = NSMenuItem(title: "Set Remote Config URL…", action: #selector(setRemoteConfigURL), keyEquivalent: "")
         setURLItem.target = self
+        setURLItem.image = Self.menuIcon("link")
         submenu.addItem(setURLItem)
 
         submenu.addItem(.separator())
@@ -613,6 +760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let updateNowItem = NSMenuItem(title: "Update Now", action: #selector(updateRemoteConfigNow), keyEquivalent: "")
         updateNowItem.target = self
+        updateNowItem.image = Self.menuIcon("arrow.down.circle")
         submenu.addItem(updateNowItem)
 
         remoteConfigItem.submenu = submenu
@@ -1059,6 +1207,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Preferences.autoRestartOnUnexpectedExit = newValue
         autoRestartItem.state = newValue ? .on : .off
         AppLog.log("Auto-restart sing-box \(newValue ? "enabled" : "disabled")")
+    }
+
+    @objc private func toggleNotificationCategory(_ sender: NSMenuItem) {
+        guard let category = sender.representedObject as? NotificationCategory else { return }
+        let newValue = !Preferences.isNotificationCategoryEnabled(category)
+        Preferences.setNotificationCategory(category, enabled: newValue)
+        sender.state = newValue ? .on : .off
+        AppLog.log("Notifications for \(category.displayName) \(newValue ? "enabled" : "disabled")")
     }
 
     /// Attempts to bring sing-box back up after an unexpected exit, if the user

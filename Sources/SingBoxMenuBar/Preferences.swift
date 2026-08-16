@@ -14,6 +14,18 @@ enum OutboundMode: String, CaseIterable {
         }
     }
 
+    /// SF Symbol for the Outbound Mode submenu — see `AppDelegate.menuIcon`. Each
+    /// mode is a genuinely distinct routing behavior, unlike most radio-style
+    /// lists elsewhere in the menu, so each gets its own icon rather than going
+    /// icon-less.
+    var symbolName: String {
+        switch self {
+        case .direct: return "arrow.up.right"
+        case .global: return "globe"
+        case .rule:   return "list.bullet.rectangle"
+        }
+    }
+
     /// Value sent to sing-box's Clash API for `PATCH /configs`, e.g. {"mode": "rule"}.
     var clashModeValue: String {
         rawValue.lowercased()
