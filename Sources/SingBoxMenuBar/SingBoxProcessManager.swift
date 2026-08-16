@@ -119,6 +119,25 @@ final class SingBoxProcessManager {
                 return
             }
 
+            // Detect an already-running sing-box (ours from a prior launch of this
+            // app, or a conflicting foreign process/port) before spawning a new one —
+            // see requirements: don't just assume the configured port is free and
+            // let sing-box fail with "address already in use".
+            switch self.resolveStartConflict(configPath: configPath) {
+            case .clear, .resolved:
+                break // proceed to spawn below, same as before this check existed
+            case .reuseExisting:
+                DispatchQueue.main.async {
+                    self.adoptExistingProcess(enableTUN: enableTUN)
+                    completion(.success(()))
+                }
+                return
+            case .failed(let message):
+                AppLog.error(message)
+                DispatchQueue.main.async { completion(.failure(SingBoxError.portConflict(message))) }
+                return
+            }
+
             let runPath: String
             if enableTUN {
                 runPath = configPath
@@ -312,13 +331,7 @@ final class SingBoxProcessManager {
     /// Best-effort: an unreadable or non-JSON config is treated as "no such
     /// inbound" (fails closed), same as `normalModeConfigPath` above.
     static func hasProxyCapableInbound(at configPath: String) -> Bool {
-        guard let data = FileManager.default.contents(atPath: configPath),
-              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let inbounds = json["inbounds"] as? [[String: Any]] else {
-            return false
-        }
-        let proxyCapableTypes: Set<String> = ["mixed", "http", "socks"]
-        return inbounds.contains { ($0["type"] as? String).map { proxyCapableTypes.contains($0.lowercased()) } ?? false }
+        SingBoxPortInspector.proxyInboundPort(at: configPath) != nil
     }
 
     /// Best-effort check for whether *a* sing-box process is alive on this machine,
@@ -372,6 +385,90 @@ final class SingBoxProcessManager {
         onStateChange?(false)
     }
 
+    // MARK: - Port/process conflict detection
+
+    /// Outcome of checking whether something is already occupying the port this
+    /// config's proxy inbound wants, before we try to spawn a new sing-box.
+    private enum ConflictResolution {
+        case clear            // nothing in the way — proceed to spawn normally
+        case reuseExisting    // sing-box is already listening on the target port — adopt it instead of spawning a second one
+        case resolved         // a conflicting non-sing-box process was found and stopped — safe to proceed
+        case failed(String)   // couldn't resolve — surface this as a start failure
+    }
+
+    /// Checks for a pre-existing process/port conflict before spawning a new
+    /// sing-box instance. Only meaningful when we don't already believe we own a
+    /// running instance (`isRunning == false`) — a restart of our *own* process is
+    /// handled separately by `stopQuietly`, which frees the port itself just before
+    /// the replacement spawns, so there's nothing to detect there.
+    ///
+    /// `configPath` (not the possibly-TUN-stripped `runPath`) is what's inspected —
+    /// the proxy inbound's port is identical either way, since normal mode only
+    /// ever removes `tun`-type inbounds, never the mixed/http/socks one.
+    private func resolveStartConflict(configPath: String) -> ConflictResolution {
+        guard !isRunning else { return .clear }
+
+        guard let port = SingBoxPortInspector.proxyInboundPort(at: configPath) else {
+            // No mixed/http/socks inbound (e.g. a TUN-only config) — nothing
+            // meaningful to check a port for. A stray sing-box process from a
+            // previous run could still be around, but without a proxy port to
+            // probe there's no reliable signal to act on here; a genuine conflict
+            // (e.g. the TUN interface already claimed) will still surface as a
+            // normal start failure from the spawn attempt itself.
+            return .clear
+        }
+
+        let listeners = SingBoxPortInspector.listeners(onPort: port)
+        guard !listeners.isEmpty else { return .clear }
+
+        if listeners.contains(where: { $0.command.lowercased() == "sing-box" }) {
+            AppLog.log("Port \(port) is already served by an existing sing-box process — reusing it instead of starting a new one")
+            return .reuseExisting
+        }
+
+        // Something else entirely is bound to the port this config needs. Try to
+        // stop it — this goes through PrivilegedCommandRunner since whatever's
+        // there may be running as a different user (root, if it's a leftover
+        // privileged process); `kill` isn't in the passwordless-sudo allowlist
+        // (see README), so this can prompt for an admin password. That's an
+        // acceptable one-off cost for a rare conflict-recovery path, unlike the
+        // routine start/reload calls this app otherwise keeps off the main thread
+        // specifically to avoid any blocking prompt.
+        for listener in listeners {
+            AppLog.log("Port \(port) is occupied by '\(listener.command)' (pid \(listener.pid)) — attempting to stop it")
+            if case .failure(let error) = PrivilegedCommandRunner.runSync("/bin/kill", ["-9", "\(listener.pid)"]) {
+                return .failed("Port \(port) is in use by '\(listener.command)' (pid \(listener.pid)), and stopping it failed: \(error.localizedDescription)")
+            }
+        }
+
+        // Give the OS a moment to actually release the socket before checking again.
+        Thread.sleep(forTimeInterval: 0.3)
+        guard SingBoxPortInspector.listeners(onPort: port).isEmpty else {
+            return .failed("Port \(port) is still in use after attempting to stop the conflicting process. Free it manually and try again.")
+        }
+        return .resolved
+    }
+
+    /// Adopts an already-running sing-box (found listening on the target port —
+    /// see `resolveStartConflict`) as "ours" instead of spawning a second instance
+    /// on top of it. We don't hold a `Process` handle for it (it wasn't launched by
+    /// this call), so there's no `terminationHandler` watching it either —
+    /// `reconcileRunningState`'s periodic pgrep-based check becomes what notices if
+    /// it later disappears, same as for any other externally-detected process.
+    ///
+    /// `isTUNEnabled` here is best-effort: we're trusting the caller's requested
+    /// mode rather than actually inspecting the adopted process's live config,
+    /// since doing that reliably would need a reachable Clash API on a config we
+    /// didn't necessarily start it with — same caveat `reconcileRunningState`
+    /// already documents for state it can observe but not fully verify.
+    private func adoptExistingProcess(enableTUN: Bool) {
+        process = nil
+        isRunning = true
+        isTUNEnabled = enableTUN
+        AppLog.log("Adopted an already-running sing-box process instead of starting a new one")
+        onStateChange?(true)
+    }
+
     /// Deletes files this app generates itself (currently just the normal-mode/no-TUN
     /// config — see `normalModeConfigPath`) — never user-authored profiles, which
     /// live elsewhere (`Preferences.profilesDirectory`) and are out of scope here.
@@ -388,6 +485,7 @@ enum SingBoxError: LocalizedError {
     case logFileUnavailable
     case privilegeNotConfigured(String)
     case normalModeConfigGenerationFailed(String)
+    case portConflict(String)
 
     var errorDescription: String? {
         switch self {
@@ -399,6 +497,8 @@ enum SingBoxError: LocalizedError {
             return message
         case .normalModeConfigGenerationFailed(let message):
             return "Couldn't prepare a normal-mode (no-TUN) configuration:\n\(message)"
+        case .portConflict(let message):
+            return message
         }
     }
 }

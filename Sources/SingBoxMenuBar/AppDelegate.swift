@@ -20,6 +20,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var currentSystemProxyService: String?
 
+    /// Port System Proxy is currently pointed at — parsed from the active
+    /// profile's mixed/http/socks inbound (see `SingBoxPortInspector`) at the
+    /// moment System Proxy was enabled, not a hardcoded assumption. `nil` whenever
+    /// `currentSystemProxyService` is, since the two are only ever set together.
+    private var currentSystemProxyPort: String?
+
     /// Periodically reconciles the menu bar with sing-box's *actual* state, so
     /// changes made externally (via the Clash API, another client, `networksetup`,
     /// or the sing-box process being started/stopped outside this app) are picked
@@ -309,17 +315,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func syncSystemProxyStateFromSystem() {
         guard let service = currentSystemProxyService ?? Preferences.preferredNetworkService else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let actuallyEnabled = SystemProxyManager.isEnabled(service: service)
+            let settings = SystemProxyManager.currentProxySettings(service: service)
+            let actuallyEnabled = settings.enabled
             DispatchQueue.main.async { [weak self] in
                 guard let self, actuallyEnabled != Preferences.systemProxyEnabled else { return }
                 AppLog.log("Detected system proxy \(actuallyEnabled ? "enabled" : "disabled") externally for '\(service)'; syncing menu bar")
                 Preferences.systemProxyEnabled = actuallyEnabled
                 self.currentSystemProxyService = actuallyEnabled ? service : nil
+                self.currentSystemProxyPort = actuallyEnabled ? settings.port : nil
                 self.systemProxyItem.state = actuallyEnabled ? .on : .off
                 AppNotifier.post(
                     category: .systemProxy,
                     title: actuallyEnabled ? "System Proxy Enabled" : "System Proxy Disabled",
-                    body: actuallyEnabled ? "Enabled externally for '\(service)'." : "Disabled externally for '\(service)'."
+                    body: actuallyEnabled ? "Enabled externally for '\(service)' on port \(settings.port ?? "?")." : "Disabled externally for '\(service)'."
                 )
                 self.refreshIcon()
             }
@@ -379,6 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             Preferences.systemProxyEnabled = false
             self.currentSystemProxyService = nil
+            self.currentSystemProxyPort = nil
             self.systemProxyItem.state = .off
             AppNotifier.post(
                 category: .systemProxy,
@@ -719,6 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     Preferences.systemProxyEnabled = false
                     self.systemProxyItem.state = .off
                     self.currentSystemProxyService = nil
+                    self.currentSystemProxyPort = nil
                     AppNotifier.post(category: .systemProxy, title: "System Proxy Disabled", body: "Disabled for '\(service)'.")
                     self.refreshIcon()
                 case .failure(let error):
@@ -728,33 +738,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             // System Proxy routes traffic to a mixed/http/socks inbound in sing-box's
             // config, so it needs both sing-box running AND that inbound to actually
-            // exist — a TUN-only config has nothing for it to connect to. Check that
-            // up front and block with a clear message rather than silently enabling
-            // a setting that won't do anything.
+            // exist — a TUN-only config has nothing for it to connect to. Parsing the
+            // port here (rather than assuming one) also doubles as that existence
+            // check: no port means no such inbound. Block with a clear message
+            // rather than silently enabling a setting that won't do anything.
             guard let path = Preferences.activeProfilePath else {
                 showNonBlockingAlert(title: "No Profile Selected", message: "Choose a profile under Switch Profile first, then try again.")
                 return
             }
-            guard SingBoxProcessManager.hasProxyCapableInbound(at: path) else {
+            guard let port = SingBoxPortInspector.proxyInboundPort(at: path) else {
                 showNonBlockingAlert(
                     title: "No Proxy Inbound in Config",
                     message: "\((path as NSString).lastPathComponent) has no mixed/http/socks inbound, so there's nothing for System Proxy to connect to. Add one to the profile, then try again."
                 )
                 return
             }
+            let portString = String(port)
 
             // Config supports it — start sing-box ourselves in normal mode (TUN left
             // disabled) if it isn't running yet, rather than erroring and making the
             // user start it by hand first. Enhanced Mode (TUN) stays a separate,
             // explicit opt-in, and — since we already confirmed a proxy-capable
             // inbound is present — the two can coexist: turning TUN on later won't
-            // disable this (see reconcileSystemProxyCapability).
+            // disable this (see reconcileSystemProxyCapability). `start` itself now
+            // checks whether something is already bound to `port` (a leftover
+            // sing-box from this app, or a conflicting foreign process) before
+            // spawning — see SingBoxProcessManager.resolveStartConflict.
             guard processManager.isRunning else {
                 startSingBox(configPath: path, enableTUN: false, busyMessage: "Starting…") { [weak self] result in
                     guard let self else { return }
                     switch result {
                     case .success:
-                        self.beginEnablingSystemProxy()
+                        self.beginEnablingSystemProxy(port: portString)
                     case .failure(let error):
                         self.showNonBlockingAlert(title: "Failed to Start sing-box", message: error.localizedDescription)
                     }
@@ -762,14 +777,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
 
-            beginEnablingSystemProxy()
+            beginEnablingSystemProxy(port: portString)
         }
     }
 
-    /// Picks (or reuses) a network service and turns System Proxy on for it. Split
-    /// out from `toggleSystemProxy` so it can run either immediately, when sing-box
-    /// is already running, or after auto-starting it in normal mode.
-    private func beginEnablingSystemProxy() {
+    /// Picks (or reuses) a network service and turns System Proxy on for it, at
+    /// `port` (parsed from the active profile — see `SingBoxPortInspector`, not a
+    /// hardcoded assumption). Split out from `toggleSystemProxy` so it can run
+    /// either immediately, when sing-box is already running, or after auto-starting
+    /// it in normal mode.
+    private func beginEnablingSystemProxy(port: String) {
         let services = SystemProxyManager.activeNetworkServices()
 
         if services.isEmpty {
@@ -780,36 +797,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Reuse a previously chosen service without prompting again, as long as
         // it's still active. Falls through to picker/auto-pick logic otherwise.
         if let preferred = Preferences.preferredNetworkService, services.contains(preferred) {
-            enableSystemProxy(on: preferred)
+            enableSystemProxy(on: preferred, port: port)
             return
         }
 
         if services.count == 1 {
             let only = services[0]
             Preferences.preferredNetworkService = only
-            enableSystemProxy(on: only)
+            enableSystemProxy(on: only, port: port)
             return
         }
 
         presentServicePicker(services: services) { [weak self] chosen in
             guard let self, let chosen else { return }
             Preferences.preferredNetworkService = chosen
-            self.enableSystemProxy(on: chosen)
+            self.enableSystemProxy(on: chosen, port: port)
         }
     }
 
-    private func enableSystemProxy(on service: String) {
-        SystemProxyManager.enable(service: service) { [weak self] result in
+    private func enableSystemProxy(on service: String, port: String) {
+        SystemProxyManager.enable(service: service, port: port) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
                 Preferences.systemProxyEnabled = true
                 self.currentSystemProxyService = service
+                self.currentSystemProxyPort = port
                 self.systemProxyItem.state = .on
                 AppNotifier.post(
                     category: .systemProxy,
                     title: "System Proxy Enabled",
-                    body: "Enabled for '\(service)'."
+                    body: "Enabled for '\(service)' on port \(port)."
                 )
                 self.refreshIcon()
             case .failure(let error):
@@ -1149,6 +1167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         Preferences.systemProxyEnabled = false
         currentSystemProxyService = nil
+        currentSystemProxyPort = nil
         systemProxyItem.state = .off
 
         if LaunchAtLogin.isEnabled {
@@ -1191,7 +1210,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func runDiagnostics() {
         AppLog.log("Running diagnostics")
-        DiagnosticsRunner.run(systemProxyService: currentSystemProxyService ?? Preferences.preferredNetworkService) { [weak self] result in
+        // Prefer the port we actually enabled System Proxy with over re-parsing the
+        // active profile — if the profile changed since, currentSystemProxyPort is
+        // what's really configured at the OS level right now, which is what this
+        // check verifies against.
+        let expectedPort = currentSystemProxyPort.flatMap(Int.init)
+                ?? Preferences.activeProfilePath.flatMap { SingBoxPortInspector.proxyInboundPort(at: $0) }
+        DiagnosticsRunner.run(
+            systemProxyService: currentSystemProxyService ?? Preferences.preferredNetworkService,
+            expectedProxyPort: expectedPort
+        ) { [weak self] result in
             self?.presentDiagnostics(result)
         }
     }

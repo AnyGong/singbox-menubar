@@ -7,9 +7,11 @@ import AppKit
 /// interactive admin-password prompt if that isn't configured yet.
 enum SystemProxyManager {
 
-    /// Adjust to match the local proxy port sing-box exposes for HTTP inbound.
+    /// Host sing-box's proxy inbounds bind to — this app only ever runs configs
+    /// with a loopback-bound mixed/http/socks inbound, so unlike the port (see
+    /// `SingBoxPortInspector.proxyInboundPort`, parsed from the active config
+    /// rather than assumed) this one constant is a safe, documented assumption.
     static let proxyHost = "127.0.0.1"
-    static let proxyPort = "7890"
     static let networksetupPath = "/usr/sbin/networksetup"
 
     /// Returns all active network service names (e.g. "Wi-Fi", "Ethernet"), in the
@@ -25,12 +27,14 @@ enum SystemProxyManager {
                 .filter { !$0.hasPrefix("*") }
     }
 
-    /// Enables the system proxy for the given service.
-    static func enable(service: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    /// Enables the system proxy for the given service, pointed at `port` — the
+    /// active config's actual proxy inbound port (see `SingBoxPortInspector`), not
+    /// a hardcoded assumption.
+    static func enable(service: String, port: String, completion: @escaping (Result<Void, Error>) -> Void) {
         applyAll(service: service, action: "enable", completion: completion) {
             [
-                PrivilegedCommandRunner.runSync(networksetupPath, ["-setwebproxy", service, proxyHost, proxyPort]),
-                PrivilegedCommandRunner.runSync(networksetupPath, ["-setsecurewebproxy", service, proxyHost, proxyPort]),
+                PrivilegedCommandRunner.runSync(networksetupPath, ["-setwebproxy", service, proxyHost, port]),
+                PrivilegedCommandRunner.runSync(networksetupPath, ["-setsecurewebproxy", service, proxyHost, port]),
                 PrivilegedCommandRunner.runSync(networksetupPath, ["-setwebproxystate", service, "on"]),
                 PrivilegedCommandRunner.runSync(networksetupPath, ["-setsecurewebproxystate", service, "on"])
             ]

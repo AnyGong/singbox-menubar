@@ -41,11 +41,15 @@ enum DiagnosticsRunner {
     ///   fallback, same as every other System Proxy call site). Passed in rather
     ///   than looked up here so this stays a pure function of what the caller
     ///   already knows, instead of duplicating that resolution logic.
-    static func run(systemProxyService: String?, completion: @escaping (DiagnosticsResult) -> Void) {
+    /// - Parameter expectedProxyPort: The active profile's actual proxy inbound
+    ///   port (see `SingBoxPortInspector.proxyInboundPort`), used to verify System
+    ///   Proxy is pointed at the *right* port — not a hardcoded assumption, since
+    ///   different configs can use different ports.
+    static func run(systemProxyService: String?, expectedProxyPort: Int?, completion: @escaping (DiagnosticsResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var checks: [DiagnosticsResult.Check] = []
             checks.append(singBoxProcessCheck())
-            checks.append(systemProxyCheck(service: systemProxyService))
+            checks.append(systemProxyCheck(service: systemProxyService, expectedPort: expectedProxyPort))
             checks.append(tunInterfaceCheck())
             checks.append(outboundModeCheck())
 
@@ -75,7 +79,7 @@ enum DiagnosticsRunner {
         return DiagnosticsResult.Check(title: "sing-box Process", status: .ok, detail: "Running (\(ownership)).")
     }
 
-    private static func systemProxyCheck(service: String?) -> DiagnosticsResult.Check {
+    private static func systemProxyCheck(service: String?, expectedPort: Int?) -> DiagnosticsResult.Check {
         guard Preferences.systemProxyEnabled else {
             return DiagnosticsResult.Check(title: "System Proxy", status: .ok, detail: "Off.")
         }
@@ -96,20 +100,28 @@ enum DiagnosticsRunner {
             )
         }
 
+        guard let expectedPort else {
+            return DiagnosticsResult.Check(
+                title: "System Proxy",
+                status: .warning,
+                detail: "Enabled for '\(service)' (pointing at \(settings.host ?? "?"):\(settings.port ?? "?")), but the active profile no longer has a mixed/http/socks inbound to verify the port against."
+            )
+        }
+
         let expectedHost = SystemProxyManager.proxyHost
-        let expectedPort = SystemProxyManager.proxyPort
-        if settings.host == expectedHost, settings.port == expectedPort {
+        let expectedPortString = String(expectedPort)
+        if settings.host == expectedHost, settings.port == expectedPortString {
             return DiagnosticsResult.Check(
                 title: "System Proxy",
                 status: .ok,
-                detail: "Enabled for '\(service)', pointing at \(expectedHost):\(expectedPort) as expected."
+                detail: "Enabled for '\(service)', pointing at \(expectedHost):\(expectedPortString) as expected."
             )
         } else {
             let actual = "\(settings.host ?? "?"):\(settings.port ?? "?")"
             return DiagnosticsResult.Check(
                 title: "System Proxy",
                 status: .warning,
-                detail: "Enabled for '\(service)', but pointing at \(actual) — expected \(expectedHost):\(expectedPort). Toggle System Proxy off and back on to fix this."
+                detail: "Enabled for '\(service)', but pointing at \(actual) — expected \(expectedHost):\(expectedPortString). Toggle System Proxy off and back on to fix this."
             )
         }
     }
@@ -157,8 +169,8 @@ enum DiagnosticsRunner {
         URLSession.shared.dataTask(with: request) { _, response, error in
             let ok = error == nil && (response as? HTTPURLResponse)?.statusCode == 200
             let detail = ok
-                ? "Reachable at \(baseURL.absoluteString)."
-                : "Not reachable at \(baseURL.absoluteString). sing-box may not be running, or the active config may be missing experimental.clash_api."
+                    ? "Reachable at \(baseURL.absoluteString)."
+                    : "Not reachable at \(baseURL.absoluteString). sing-box may not be running, or the active config may be missing experimental.clash_api."
             completion(DiagnosticsResult.Check(title: "Clash API", status: ok ? .ok : .failure, detail: detail))
         }.resume()
     }
