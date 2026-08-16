@@ -71,12 +71,34 @@ enum SingBoxPortInspector {
         // "COMMAND   PID   USER   FD   TYPE  DEVICE SIZE/OFF NODE NAME" — command
         // is column 0, PID is column 1.
         return output
-            .split(separator: "\n")
-            .dropFirst() // header
-            .compactMap { line -> Listener? in
-                let columns = line.split(separator: " ", omittingEmptySubsequences: true)
-                guard columns.count >= 2, let pid = Int32(columns[1]) else { return nil }
-                return Listener(pid: pid, command: String(columns[0]))
-            }
+                .split(separator: "\n")
+                .dropFirst() // header
+                .compactMap { line -> Listener? in
+            let columns = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard columns.count >= 2, let pid = Int32(columns[1]) else { return nil }
+            return Listener(pid: pid, command: String(columns[0]))
+        }
+    }
+
+    /// The Clash API's `external_controller` address (e.g. "127.0.0.1:9090") and
+    /// optional `secret`, as declared in `configPath`'s `experimental.clash_api`
+    /// block. This app previously assumed sing-box's documented default (9090, no
+    /// secret) everywhere `ClashAPIClient` is used — which silently broke live mode
+    /// switching, "Open Control Panel", and Diagnostics' reachability check for any
+    /// profile that customizes either, since sing-box itself was listening
+    /// somewhere else entirely. Returns `nil` if the config can't be read/parsed or
+    /// declares no `experimental.clash_api` block at all — callers should leave
+    /// whatever endpoint is already configured untouched in that case, not fall
+    /// back to a guess (see `AppDelegate.syncClashAPIEndpoint`).
+    static func clashAPIEndpoint(at configPath: String) -> (address: String, secret: String?)? {
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let experimental = json["experimental"] as? [String: Any],
+              let clashAPI = experimental["clash_api"] as? [String: Any],
+              let controller = clashAPI["external_controller"] as? String,
+              !controller.isEmpty else {
+            return nil
+        }
+        return (controller, clashAPI["secret"] as? String)
     }
 }

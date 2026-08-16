@@ -75,6 +75,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// `setBusyStatus`/`clearBusyStatus`, read by `updateStatusLine`.
     private var busyStatusMessage: String?
 
+    /// `true` while a start/stop/restart is already in flight (see
+    /// `setBusyStatus`/`clearBusyStatus`). Every action that can trigger one of
+    /// those — System Proxy, TUN, profile switch, reload, and the bottom status
+    /// control — checks this before doing anything, as a defense-in-depth backstop
+    /// alongside disabling the corresponding menu items in `updateStatusLine`:
+    /// AppKit's `isEnabled` re-render isn't necessarily synchronous with a rapid
+    /// double-click/double-invocation, so relying on disabled state alone isn't
+    /// quite airtight. Without this guard, two overlapping `processManager.start()`
+    /// calls race independently on a background queue (validation, privilege
+    /// checks, port-conflict resolution) before serializing on the main thread —
+    /// the second one's `stopQuietly()` tears down whatever the first just spawned,
+    /// which is how e.g. clicking System Proxy then immediately TUN could leave
+    /// System Proxy silently pointed at a port nothing is listening on anymore.
+    private var isBusy: Bool { busyStatusMessage != nil }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.log("App launched")
 
@@ -156,6 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let path = Preferences.activeProfilePath {
             configWatcher.watch(path: path)
+            // Covers the case where sing-box is already running before this app
+            // launched (adopted via `syncExternalState`/`reconcileRunningState`
+            // below) — that path never goes through `startSingBox`, so without
+            // this, ClashAPIClient would sit on its 127.0.0.1:9090 default until
+            // the next actual start/reload, even if this profile declares a
+            // different Clash API endpoint.
+            syncClashAPIEndpoint(configPath: path)
             // Warm the validation cache for the active profile at launch, in the
             // background, so the *first* start/reload the user does — likely
             // moments after opening the menu — can hit the cache instead of
@@ -633,10 +655,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let busy = busyStatusMessage != nil
         // Clicking mid-transition (e.g. while "Switching to TUN mode…" is showing)
-        // would race the operation already in flight — disable the control itself
-        // for that window, same as the old Restart/Stop items were.
+        // would race the operation already in flight — every control that can kick
+        // off a start/stop/restart needs to be disabled for that window, not just
+        // the status line itself. This used to only cover statusLineItem/
+        // controlPanelItem, which is exactly why System Proxy and TUN were still
+        // clickable (and so re-triggerable) mid-transition — see
+        // `toggleSystemProxy`/`toggleTUN`'s own `guard !isBusy` for the second,
+        // defense-in-depth layer of this same fix.
         statusLineItem.isEnabled = !busy
         controlPanelItem.isEnabled = processManager.isRunning && !busy
+        systemProxyItem.isEnabled = !busy
+        tunItem.isEnabled = !busy
+        switchProfileItem.isEnabled = !busy
     }
 
     /// Builds the status item's title as "● sing-box: …" with only the dot colored
@@ -672,12 +702,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// should go through this rather than calling `processManager.start` directly,
     /// so the "don't just freeze" treatment is consistent everywhere (Enhanced
     /// Mode, Reload Configuration, profile switches, System Proxy's auto-start).
+    ///
+    /// Also the single choke point for keeping `ClashAPIClient` pointed at whatever
+    /// `configPath` actually declares (see `syncClashAPIEndpoint`) — every start
+    /// funnels through here regardless of *why* (fresh start, reload, profile
+    /// switch, mode change), so this is the one place that guarantees the endpoint
+    /// never goes stale, rather than needing every call site to remember to sync it.
     private func startSingBox(configPath: String, enableTUN: Bool, busyMessage: String, completion: @escaping (Result<Void, Error>) -> Void) {
         setBusyStatus(busyMessage)
+        syncClashAPIEndpoint(configPath: configPath)
         processManager.start(configPath: configPath, enableTUN: enableTUN) { [weak self] result in
             self?.clearBusyStatus()
             completion(result)
         }
+    }
+
+    /// Points `ClashAPIClient.shared` at whatever `configPath`'s own
+    /// `experimental.clash_api` block declares, instead of leaving it hardcoded to
+    /// sing-box's documented default (127.0.0.1:9090, no secret) regardless of what
+    /// the config actually says. That mismatch is exactly why live outbound-mode
+    /// switching, "Open Control Panel", and Diagnostics' Clash API check could all
+    /// fail against a perfectly healthy sing-box process — they were talking to the
+    /// wrong port (or missing a required secret) whenever a profile customized
+    /// either. No-ops (leaves the current endpoint as-is) when the config declares
+    /// no `experimental.clash_api` at all — see `SingBoxPortInspector
+    /// .clashAPIEndpoint`'s doc comment.
+    private func syncClashAPIEndpoint(configPath: String) {
+        guard let endpoint = SingBoxPortInspector.clashAPIEndpoint(at: configPath) else { return }
+        guard let url = URL(string: "http://\(endpoint.address)") else {
+            AppLog.error("Config declares an unparseable Clash API address '\(endpoint.address)' — leaving ClashAPIClient pointed at its previous target.")
+            return
+        }
+        if ClashAPIClient.shared.baseURL != url {
+            AppLog.log("Clash API endpoint set to \(url.absoluteString), from \((configPath as NSString).lastPathComponent)")
+        }
+        ClashAPIClient.shared.baseURL = url
+        ClashAPIClient.shared.secret = endpoint.secret
     }
 
     // MARK: - Actions
@@ -713,6 +773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleSystemProxy() {
+        guard !isBusy else { return }
         if Preferences.systemProxyEnabled {
             guard let service = currentSystemProxyService else {
                 Preferences.systemProxyEnabled = false
@@ -844,6 +905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleTUN() {
+        guard !isBusy else { return }
         if processManager.isTUNEnabled {
             // Fully stopping is the only way to drop the TUN interface — there's no
             // "downgrade to normal mode in place" path. If System Proxy is also on,
@@ -866,6 +928,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func selectProfile(_ sender: NSMenuItem) {
+        guard !isBusy else { return }
         guard let url = sender.representedObject as? URL else { return }
 
         // Preflight validation before switching anything — an invalid profile
@@ -946,6 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func reloadConfiguration() {
+        guard !isBusy else { return }
         guard let path = Preferences.activeProfilePath else { return }
         // Same mode it was already running in — reload shouldn't change that.
         startSingBox(configPath: path, enableTUN: processManager.isTUNEnabled, busyMessage: "Reloading configuration…") { [weak self] result in
@@ -967,6 +1031,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// System Proxy if it'd otherwise be left dangling (`disableSystemProxyIfDangling`,
     /// via `onStateChange`), same as it always has.
     @objc private func toggleSingBoxRunning() {
+        guard !isBusy else { return }
         if processManager.isRunning {
             processManager.stop()
         } else {
